@@ -1,6 +1,6 @@
 # Turnover + Intermittent Interactions (TOII) Filaments
 
-TOII Filaments are introduced here as a minimal "active nematic" system that captures the two essential activity modes of the cell cytoskeleton: turnover of components and intermittent crosslinking by partner molecules.
+TOII Filaments are introduced here as a minimal "active nematic" system that captures, on a nematic passive scaffold (filaments), the two essential activity modes of the cell cytoskeleton: turnover of components and intermittent crosslinking by partner molecules.
 
 We consider bead-spring polymers, a classical minimal model for filaments that exhibit the following important features:
 - They have well-defined constituent subunits (monomers): the beads. This in turn allows to easily implement two essential features:
