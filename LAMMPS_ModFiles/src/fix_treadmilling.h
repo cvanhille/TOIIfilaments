@@ -66,8 +66,8 @@ class FixTreadmilling : public Fix {
   int natoms, nbonds, nangles;                     // number of atoms, bonds and angles created in this timestep
   int natomstotal, nbondstotal, nanglestotal;      // cumulative number of atoms, bonds and angles created
 
-  void check_ghosts();
-  void update_topology();
+  void check_ghosts();                             // ensure ghost atoms have correct partner info after communication -- adapted from fix_bond_create.cpp
+  void update_topology();                          // 
   void rebuild_special_one(int);
   void create_angles(int);
   void create_dihedrals(int);

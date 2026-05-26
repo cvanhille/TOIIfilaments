@@ -377,6 +377,9 @@ void FixTreadmilling::post_integrate()
 
   if (!has_creation_time) return;
 
+  // Ensure neighbor list is current for ghost atoms
+  if (lastcheck <= neighbor->lastcall) check_ghosts();
+
   int ncreated_local = 0;
 
   double dt = update->dt;
@@ -1000,46 +1003,117 @@ double FixTreadmilling::compute_shrinkage_rate(double lifetime)
   return r_off_base * (1.0 - exp(-r_hyd * lifetime));
 }
 
-/* ---------------------------------------------------------------------- */
-int FixTreadmilling::pack_forward_comm(int n, int *list, double *buf,
-                                     int /*pbc_flag*/, int * /*pbc*/)
+/* ----------------------------------------------------------------------
+   ensure all atoms 2 hops away from owned atoms are in ghost list
+   this allows dihedral 1-2-3-4 to be properly created
+     and special list of 1 to be properly updated
+   if I own atom 1, but not 2,3,4, and bond 3-4 is added
+     then 2,3 will be ghosts and 3 will store 4 as its finalpartner
+  STRAIGHT FROM fix_bond_create.cpp
+------------------------------------------------------------------------- */
+
+void FixTreadmilling::check_ghosts()
 {
-  int i,j,k,m,ns;
+  int i,j,n;
+  tagint *slist;
 
   int **nspecial = atom->nspecial;
   tagint **special = atom->special;
+  int nlocal = atom->nlocal;
 
-  m = 0;
-  for (i = 0; i < n; i++) {
-    j = list[i];
-    ns = nspecial[j][0];
-    buf[m++] = ubuf(ns).d;
-    for (k = 0; k < ns; k++)
-      buf[m++] = ubuf(special[j][k]).d;
+  int flag = 0;
+  for (i = 0; i < nlocal; i++) {
+    slist = special[i];
+    n = nspecial[i][1];
+    for (j = 0; j < n; j++)
+      if (atom->map(slist[j]) < 0) flag = 1;
   }
-  return m;
+
+  int flagall;
+  MPI_Allreduce(&flag,&flagall,1,MPI_INT,MPI_SUM,world);
+  if (flagall)
+    error->all(FLERR, Error::NOLASTLINE, "Fix {} needs ghost atoms from further away", style);
+  lastcheck = update->ntimestep;
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   double loop over my atoms and created bonds
+   influenced = 1 if atom's topology is affected by any created bond
+     yes if is one of 2 atoms in bond
+     yes if either atom ID appears in as 1-2 or 1-3 in atom's special list
+     else no
+   if influenced by any created bond:
+     rebuild the atom's special list of 1-2,1-3,1-4 neighs
+     check for angles to create due modified special list
 
-void FixTreadmilling::unpack_forward_comm(int n, int first, double *buf)
+  ADAPTED FROM fix_bond_create.cpp
+------------------------------------------------------------------------- */
+
+void FixTreadmilling::update_topology()
 {
-  int i,j,m,ns,last;
+  int i,j,k,n,influence,influenced;                                   // influence = does this atom "touch" a newly created bond?; influenced = does this atom touch any newly created bond?
+  tagint id1,id2;
+  tagint *slist;
 
+  tagint *tag = atom->tag;
   int **nspecial = atom->nspecial;
   tagint **special = atom->special;
+  int nlocal = atom->nlocal;
 
-  m = 0;
-  last = first + n;
-  for (i = first; i < last; i++) {
-    ns = (int) ubuf(buf[m++]).i;
-    nspecial[i][0] = ns;
-    for (j = 0; j < ns; j++)
-      special[i][j] = (tagint) ubuf(buf[m++]).i;
+  nangles = 0;
+  overflow = 0;
+
+  for (i = 0; i < nlocal; i++) {
+    influenced = 0;                                                   // reset per atom i, before looping over all new bonds
+    slist = special[i];
+
+    for (j = 0; j < ncreate; j++) {
+      id1 = created[j][0];
+      id2 = created[j][1];
+
+      influence = 0;
+      // compute influence of bond j on atom i
+      if (tag[i] == id1 || tag[i] == id2) influence = 1;              // atom i IS one of the bond endpoints
+      else {
+        n = nspecial[i][1];                                           // number of 1-3 neighbors (angle partners)
+        for (k = 0; k < n; k++)
+          if (slist[k] == id1 || slist[k] == id2) {                   // atom i is a 1-3 neighbor of a bond endpoint
+            influence = 1;
+            break;
+          }
+      }
+      if (!influence) continue;
+      influenced = 1;                                                 // at least one bond affected atom i
+    }
+
+    // rebuild_special_one() first, since used by create_angles, etc
+
+    if (influenced) {
+      rebuild_special_one(i);                                         // update 1-2/1-3/1-4 neighbor list
+      create_angles(i);                                               // create new angles involving atom i
+    }
   }
+
+  int overflowall;
+  MPI_Allreduce(&overflow,&overflowall,1,MPI_INT,MPI_SUM,world);
+  if (overflowall)
+    error->all(FLERR, Error::NOLASTLINE,
+               "Fix {} induced too many angles per atom", style);
+
+  int newton_bond = force->newton_bond;
+  int all_angles;
+  MPI_Allreduce(&nangles,&all_angles,1,MPI_INT,MPI_SUM,world);
+  if (!newton_bond) all /= 3;
+  atom->nangles += all;
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   re-build special list of atom M
+   does not affect 1-2 neighs (already include effects of new bond)
+   affects 1-3 and 1-4 neighs due to other atom's augmented 1-2 neighs
+
+  ADAPTED FROM fix_bond_create.cpp
+------------------------------------------------------------------------- */
 
 void FixTreadmilling::rebuild_special_one(int m)
 {
@@ -1066,7 +1140,7 @@ void FixTreadmilling::rebuild_special_one(int m)
   for (i = 0; i < cn1; i++) {
     n = atom->map(copy[i]);
     if (n < 0)
-      error->one(FLERR, "Fix treadmilling needs ghost atoms from further away");
+      error->one(FLERR, Error::NOLASTLINE, "Fix {} needs ghost atoms from further away", style);
     slist = special[n];
     n1 = nspecial[n][0];
     for (j = 0; j < n1; j++)
@@ -1075,7 +1149,7 @@ void FixTreadmilling::rebuild_special_one(int m)
 
   cn2 = dedup(cn1,cn2,copy);
   if (cn2 > atom->maxspecial)
-    error->one(FLERR, "Special list size exceeded in fix treadmilling");
+    error->one(FLERR, Error::NOLASTLINE, "Special list size exceeded in fix {}", style);
 
   // new 1-4 neighs of atom M, based on 1-2 neighs of 1-3 neighs
   // exclude self
@@ -1085,7 +1159,7 @@ void FixTreadmilling::rebuild_special_one(int m)
   for (i = cn1; i < cn2; i++) {
     n = atom->map(copy[i]);
     if (n < 0)
-      error->one(FLERR, "Fix treadmilling needs ghost atoms from further away");
+      error->one(FLERR, Error::NOLASTLINE, "Fix {} needs ghost atoms from further away", style);
     slist = special[n];
     n1 = nspecial[n][0];
     for (j = 0; j < n1; j++)
@@ -1094,7 +1168,7 @@ void FixTreadmilling::rebuild_special_one(int m)
 
   cn3 = dedup(cn2,cn3,copy);
   if (cn3 > atom->maxspecial)
-    error->one(FLERR, "Special list size exceeded in fix treadmilling");
+    error->one(FLERR, Error::NOLASTLINE, "Special list size exceeded in fix {}", style);
 
   // store new special list with atom M
 
@@ -1102,6 +1176,185 @@ void FixTreadmilling::rebuild_special_one(int m)
   nspecial[m][1] = cn2;
   nspecial[m][2] = cn3;
   memcpy(special[m],copy,cn3*sizeof(int));
+}
+
+/* ----------------------------------------------------------------------
+   remove all ID duplicates in copy from Nstart:Nstop-1
+   compare to all previous values in copy
+   return N decremented by any discarded duplicates
+
+  ADAPTED FROM fix_bond_create.cpp
+------------------------------------------------------------------------- */
+
+int FixTreadmilling::dedup(int nstart, int nstop, tagint *copy)
+{
+  int i;
+
+  int m = nstart;
+  while (m < nstop) {
+    for (i = 0; i < m; i++)
+      if (copy[i] == copy[m]) {
+        copy[m] = copy[nstop-1];
+        nstop--;
+        break;
+      }
+    if (i == m) m++;
+  }
+
+  return nstop;
+}
+
+/* ----------------------------------------------------------------------
+   create any angles owned by atom M induced by newly created bonds
+   walk special list to find all possible angles to create
+   only add an angle if a new bond is one of its 2 bonds (I-J,J-K)
+   for newton_bond on, atom M is central atom
+   for newton_bond off, atom M is any of 3 atoms in angle
+
+  ADAPTED FROM fix_bond_create.cpp
+------------------------------------------------------------------------- */
+
+void FixTreadmilling::create_angles(int m)
+{
+  int i,j,n,i2local,n1,n2;
+  tagint i1,i2,i3;
+  tagint *s1list,*s2list;
+
+  tagint *tag = atom->tag;
+  int **nspecial = atom->nspecial;
+  tagint **special = atom->special;
+
+  int num_angle = atom->num_angle[m];
+  int *angle_type = atom->angle_type[m];
+  tagint *angle_atom1 = atom->angle_atom1[m];
+  tagint *angle_atom2 = atom->angle_atom2[m];
+  tagint *angle_atom3 = atom->angle_atom3[m];
+
+  // atom M is central atom in angle
+  // double loop over 1-2 neighs
+  // avoid double counting by 2nd loop as j = i+1,N not j = 1,N
+  // consider all angles, only add if:
+  //   a new bond is in the angle and atom types match
+
+  i2 = tag[m];
+  n2 = nspecial[m][0];
+  s2list = special[m];
+
+  for (i = 0; i < n2; i++) {
+    i1 = s2list[i];
+    for (j = i+1; j < n2; j++) {
+      i3 = s2list[j];
+
+      // angle = i1-i2-i3
+
+      for (n = 0; n < ncreate; n++) {
+        if (created[n][0] == i1 && created[n][1] == i2) break;
+        if (created[n][0] == i2 && created[n][1] == i1) break;
+        if (created[n][0] == i2 && created[n][1] == i3) break;
+        if (created[n][0] == i3 && created[n][1] == i2) break;
+      }
+      if (n == ncreate) continue;
+
+      // NOTE: this is place to check atom types of i1,i2,i3
+
+      if (num_angle < atom->angle_per_atom) {
+        angle_type[num_angle] = atype;
+        angle_atom1[num_angle] = i1;
+        angle_atom2[num_angle] = i2;
+        angle_atom3[num_angle] = i3;
+        num_angle++;
+        nangles++;
+      } else overflow = 1;
+    }
+  }
+
+  atom->num_angle[m] = num_angle;
+  if (force->newton_bond) return;
+
+  // for newton_bond off, also consider atom M as atom 1 in angle
+
+  i1 = tag[m];
+  n1 = nspecial[m][0];
+  s1list = special[m];
+
+  for (i = 0; i < n1; i++) {
+    i2 = s1list[i];
+    i2local = atom->map(i2);
+    if (i2local < 0)
+      error->one(FLERR, Error::NOLASTLINE, "Fix {} needs ghost atoms from further away", style);
+    s2list = special[i2local];
+    n2 = nspecial[i2local][0];
+
+    for (j = 0; j < n2; j++) {
+      i3 = s2list[j];
+      if (i3 == i1) continue;
+
+      // angle = i1-i2-i3
+
+      for (n = 0; n < ncreate; n++) {
+        if (created[n][0] == i1 && created[n][1] == i2) break;
+        if (created[n][0] == i2 && created[n][1] == i1) break;
+        if (created[n][0] == i2 && created[n][1] == i3) break;
+        if (created[n][0] == i3 && created[n][1] == i2) break;
+      }
+      if (n == ncreate) continue;
+
+      // NOTE: this is place to check atom types of i1,i2,i3
+
+      if (num_angle < atom->angle_per_atom) {
+        angle_type[num_angle] = atype;
+        angle_atom1[num_angle] = i1;
+        angle_atom2[num_angle] = i2;
+        angle_atom3[num_angle] = i3;
+        num_angle++;
+        nangles++;
+      } else overflow = 1;
+    }
+  }
+
+  atom->num_angle[m] = num_angle;
+}
+
+/* ---------------------------------------------------------------------- */
+
+// Adapted from fix_bond_create.cpp -- forward comm all specials so ghost atoms have updated bond info
+int FixTreadmilling::pack_forward_comm(int n, int *list, double *buf,
+                                     int /*pbc_flag*/, int * /*pbc*/)
+{
+  int i,j,k,m,ns;
+
+  int **nspecial = atom->nspecial;
+  tagint **special = atom->special;
+
+  m = 0;
+  for (i = 0; i < n; i++) {
+    j = list[i];
+    ns = nspecial[j][0];
+    buf[m++] = ubuf(ns).d;
+    for (k = 0; k < ns; k++)
+      buf[m++] = ubuf(special[j][k]).d;
+  }
+  return m;
+}
+
+/* ---------------------------------------------------------------------- */
+
+// Adapted from fix_bond_create.cpp -- forward comm all specials so ghost atoms have updated bond info
+void FixTreadmilling::unpack_forward_comm(int n, int first, double *buf)
+{
+  int i,j,m,ns,last;
+
+  int **nspecial = atom->nspecial;
+  tagint **special = atom->special;
+
+  m = 0;
+  last = first + n;
+  for (i = first; i < last; i++) {
+    ns = (int) ubuf(buf[m++]).i;
+    nspecial[i][0] = ns;
+    for (j = 0; j < ns; j++)
+      special[i][j] = (tagint) ubuf(buf[m++]).i;
+  }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1122,6 +1375,6 @@ double FixTreadmilling::compute_vector(int n)
 double FixTreadmilling::memory_usage()
 {
   double bytes = 0.0;
-  bytes += (double)(atom->nmax * 2) * sizeof(int);  // nlocalkeep, nghostlykeep
+  // bytes += (double)(atom->nmax * 2) * sizeof(int);  // nlocalkeep, nghostlykeep
   return bytes;
 }
