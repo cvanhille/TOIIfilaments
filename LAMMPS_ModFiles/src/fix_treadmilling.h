@@ -34,53 +34,37 @@ class FixTreadmilling : public Fix {
   ~FixTreadmilling() override;
   int setmask() override;
   void init() override;
-  void init_list(int, class NeighList *) override; // From FixBondCreate -- keep?
+  void init_list(int, class NeighList *) override;
   void post_integrate() override;
   void post_integrate_respa(int, int) override;
 
   int pack_forward_comm(int, int *, double *, int, int *) override;
   void unpack_forward_comm(int, int, double *) override;
-  int pack_reverse_comm(int, int, double *) override; // From FixBondCreate -- keep?
-  void unpack_reverse_comm(int, int *, double *) override; // From FixBondCreate -- keep?
-  void grow_arrays(int) override; // From FixBondCreate -- keep?
-  void copy_arrays(int, int, int) override; // From FixBondCreate -- keep?
-  int pack_exchange(int, double *) override; // From FixBondCreate -- keep?
-  int unpack_exchange(int, double *) override; // From FixBondCreate -- keep?
   double compute_vector(int) override; // From FixBondCreate -- keep?
   double memory_usage() override;
 
- protected: // ALL THESE FROM FixBondCreate -- keep????
-  int iatomtype, jatomtype;
-  int btype, seed;
-  int imaxbond, jmaxbond;
-  int inewtype, jnewtype;
-  int constrainflag, constrainpass;
-  double amin, amax;
-  double cutsq, fraction;
-  int atype, dtype, itype;
-  int angleflag, dihedralflag, improperflag;
-  int molecule_keyword;
+ protected:
+  int ptype, btype, atype                          // particle type, bond type and angle type to create
 
-  int overflow;
-  tagint lastcheck;
+  int seed;                                        // RNG seed
 
-  int *bondcount;  // THIS I NEED TO KEEP IF I KEEP BONDCOUNT IN .cpp
-  int createcount, createcounttotal;
-  int nmax;
-  tagint *partner, *finalpartner;
-  double *distsq, *probability;
+  int overflow;                                    // flag set if new bonds/angles overflow the per-atom storage
+  tagint lastcheck;                                // timestep of last ghost-distance check; used by check_ghosts()
 
-  int ncreate, maxcreate;
-  tagint **created;  // THIS I NEED TO KEEP IF I KEEP CREATED IN .cpp
+//   tagint **created;  // THIS I NEED TO KEEP IF I KEEP CREATED IN .cpp
+  tagint **created_bonds;                          // array of created bond pairs ([tag_i, tag_j]) - used to update special lists and angle creation -- INSTEAD of created from fix bond/create
+  int ncreated_bonds, maxcreated_bonds;            // created bonds counter (for created_bonds array) and allocated size capacity
 
-  tagint *copy;  // THIS I NEED TO KEEP
+  tagint *copy;                                    // temporary buffer used when rebuilding an atom’s special neighbor list
 
-  class RanMars *random;  // THIS I NEED TO KEEP
-  class NeighList *list;  // THIS I NEED TO KEEP
+  class RanMars *random;                           // RNG object
+  class NeighList *list;                           // pointer to the neighbor list assigned via init_list() - needed for neighbor-list callbacks
 
-  int countflag, commflag;
-  int nlevels_respa;
-  int nangles, ndihedrals, nimpropers;
+  int commflag;                                    // selects which data is packed/unpacked during communication
+  int nlevels_respa;                               // number of RESPA levels if integrator is RESPA
+  
+  int natoms, nbonds, nangles;                     // number of atoms, bonds and angles created in this timestep
+  int natomstotal, nbondstotal, nanglestotal;      // cumulative number of atoms, bonds and angles created
 
   void check_ghosts();
   void update_topology();
@@ -105,9 +89,6 @@ class FixTreadmilling : public Fix {
   // Filament nucleation modes
   int nuc_mode;           // 0=none, 1=free nucleation, 2=branched
   int nucleator_type;     // atom type that can nucleate branches (for mode 2)
-
-  // Particle types
-  int create_type;        // type of newly created particles
 
   // Per-atom properties
   int birth_time_index;            // birth time property index -- to access birth times as `double *birth_time = atom->dvector[birth_time_index];`
@@ -139,9 +120,6 @@ class FixTreadmilling : public Fix {
   int delete_bonds(int);                                          // delete bonds involving particle i, return index for bound particle (index for subtail which become new tail)
   
   double compute_shrinkage_rate(double);                          // compute r_off(lifetime) = r_0(1-exp(-r_hyd*lifetime))
-  
-  // Communication helper (needed for MPI if particles cross processors)
-  int *nlocalkeep, *nghostlykeep;
 };
 
 }  // namespace LAMMPS_NS

@@ -128,14 +128,13 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
   if (nevery <= 0) error->all(FLERR, 3, "Illegal fix {} nevery value {}", style, nevery);
 
   // Fix.h variables
-  dynamic_group_allow = 1;              // set to 1 because it can be used can be used with dynamic group
+  dynamic_group_allow = 1;              // set to 1 because it can be used with dynamic group
   force_reneighbor = 1;                 // set to 1 so the fix forces reneighboring
   next_reneighbor = -1;                 // next timestep to force a reneighboring -- set to -1 like in fix_bond_create.cpp
-  // this are straight from fix_bond_create -- NOT SURE WE NEED THEM
-  vector_flag = 1;                      // 0/1 if compute_vector() function exists -- NOT SURE WE NEED
-  size_vector = 2;                      // length of global vector -- NOT SURE WE NEED
-  global_freq = 1;                      // frequency s/v data is available at -- NOT SURE WE NEED
-  extvector = 0;                        // 0/1/-1 if global vector is all int/ext/extlist -- NOT SURE WE NEED
+  vector_flag = 1;                      // 0/1 if compute_vector() function exists
+  size_vector = 6;                      // length of global vector -- 6 variables: timestep and cumul # of atoms, bonds and angles created
+  extvector = 0;                        // 0/1/-1 if global vector is all int/ext/extlist
+  global_freq = 1;                      // frequency s/v data is available at -- LIKE IN fix_bond_create -- NOT SURE
 
   // Default values for fix parameters
   // Kinetics: default to passive
@@ -150,10 +149,9 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
   noise_sigma = 0.1;                    // creation position sampling noise magnitude
   max_trials = MAXTRIALS;               // maximum # of trials allowed before giving up on creation
   overlap_cut = 1.2;                    // overlap criterion distance (don't allow creation below this)
-  
-  // particle_type = 1;
-  // head_marker_type = -1;
-  // tail_marker_type = -1;
+  ptype = 1;                            // particle type to create -- default: type 1
+  btype = 1;                            // bond type to create -- default: type 1
+  atype = 1;                            // angle type to create -- default: type 1
   
 //   creation_time_flag = -1;
 //   filament_id_flag = -1;
@@ -212,6 +210,18 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
       if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling overlap");
       overlap_cut = utils::numeric(FLERR,arg[iarg+1],false,lmp);
       iarg += 2;
+    } else if (strcmp(arg[iarg],"ptype") == 0) {
+      if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling ptype");
+      ptype = utils::inumeric(FLERR,arg[iarg+1],false,lmp);
+      iarg += 2;
+    } else if (strcmp(arg[iarg],"btype") == 0) {
+      if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling btype");
+      btype = utils::inumeric(FLERR,arg[iarg+1],false,lmp);
+      iarg += 2;
+    } else if (strcmp(arg[iarg],"atype") == 0) {
+      if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling atype");
+      atype = utils::inumeric(FLERR,arg[iarg+1],false,lmp);
+      iarg += 2;
     } else if (strcmp(arg[iarg],"seed") == 0) {
       if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling seed");
       seed = utils::inumeric(FLERR,arg[iarg+1],false,lmp);
@@ -234,8 +244,21 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
   fprintf(lmp->screen, "  noise_sigma = %.2f\n", noise_sigma);
   fprintf(lmp->screen, "  max_trials  = %d\n", max_trials);
   fprintf(lmp->screen, "  overlap_cut = %.2f\n", overlap_cut);
+  fprintf(lmp->screen, "  ptype        = %d\n", ptype);
+  fprintf(lmp->screen, "  btype        = %d\n", btype);
+  fprintf(lmp->screen, "  atype        = %d\n", atype);
   fprintf(lmp->screen, "  seed        = %d\n", seed);
   fprintf(lmp->screen, "\n\n");
+
+  // Error check
+  if (atom->molecular != Atom::MOLECULAR)
+    error->all(FLERR, Error::NOLASTLINE, "Cannot use fix {} with non-molecular systems", style);
+  if (ptype < 1 || ptype > atom->ntypes)
+    error->all(FLERR, Error::NOLASTLINE, "Illegal fix {} particle type {} (must be between 1 and {})", style, ptype, atom->ntypes);
+  if (btype < 1 || btype > atom->nbondtypes)
+    error->all(FLERR, Error::NOLASTLINE, "Illegal fix {} bond type {} (must be between 1 and {})", style, btype, atom->nbondtypes);
+  if (atype < 1 || atype > atom->nangletypes)
+    error->all(FLERR, Error::NOLASTLINE, "Illegal fix {} angle type {} (must be between 1 and {})", style, atype, atom->nangletypes);
 
   // initialize Marsaglia RNG with processor-unique seed
   random = new RanMars(lmp, seed + comm->me);
@@ -243,36 +266,33 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
   // Update squared cutoff distance
   overlap_sq = overlap_cut*overlap_cut;
 
-  // Perform initial allocation of atom-based arrays
-  // // register with Atom class
-  // // bondcount values will be initialized in setup()
-  bondcount = nullptr;
-  FixBondCreate::grow_arrays(atom->nmax);
-  atom->add_callback(Atom::GROW);
-  countflag = 0;
-  // // set comm sizes needed by this fix
-  // // forward is big due to comm of broken bonds and 1-2 neighbors
+  // Set comm sizes needed by this fix
+  // forward is big due to comm of broken bonds and 1-2 neighbors
   comm_forward = MAX(2,2+atom->maxspecial);
   comm_reverse = 2;
-  // // allocate arrays local to this fix
-  nmax = 0;
 
-  maxcreate = 0;
-  created = nullptr;
+  // Initialize arrays for created bonds
+  ncreated_bonds = 0;
+  maxcreated_bonds = 0;
+  created_bonds = nullptr;
 
+  // Allocate copy
   // copy = special list for one atom
   // size = ms^2 + ms is sufficient
   // b/c in rebuild_special_one() neighs of all 1-2s are added,
   //   then a dedup(), then neighs of all 1-3s are added, then final dedup()
   // this means intermediate size cannot exceed ms^2 + ms
-
+  // copied straight from fix_bond_create.cpp
   int maxspecial = atom->maxspecial;
   copy = new tagint[maxspecial*maxspecial + maxspecial];
 
-  // zero out stats
-
-  createcount = 0;
-  createcounttotal = 0;
+  // Zero out stats
+  natoms = 0;
+  nbonds = 0;
+  nangles = 0;
+  natomstotal = 0;
+  nbondstotal = 0;
+  nanglestotal = 0;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -280,8 +300,8 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
 FixTreadmilling::~FixTreadmilling()
 {
   delete random;
-  memory->destroy(nlocalkeep);
-  memory->destroy(nghostlykeep);
+  memory->destroy(created);
+  delete [] copy;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -320,27 +340,41 @@ void FixTreadmilling::init()
   filpos_index = atom->find_custom("filpos", flagFP, colsFP);
   if (filpos_index < 0 || flagFP != 1) {error->all(FLERR, "Fix treadmilling: i_filpos property not found. ");}
 
-  // Check for RESPA
-  if (strstr(update->integrate_style,"respa")) {
-    nlevels_respa = ((Respa *)update->integrate)->nlevels;
-    respa_level = nlevels_respa - 1;
-  }
-
   // Check for pair style
   if (force->pair == nullptr)
     error->all(FLERR,"Fix treadmilling requires a pair style");
 
-  // Initialize neighbor list counter
-  int n = atom->nlocal + atom->nghost;
-  memory->create(nlocalkeep,atom->nmax,"treadmilling:nlocalkeep");
-  memory->create(nghostlykeep,atom->nmax,"treadmilling:nghostlykeep");
+  // Check for bond style
+  if (force->bond == nullptr)
+    error->all(FLERR, "Fix treadmilling requires a bond style");
+
+  // Check for angle style
+  if (force->angle == nullptr)
+    error-all(FLERR, "Fix treadmilling requires an angle style");
+
+  // Check for RESPA and get number of RESPA levels if so
+  if (utils::strmatch(update->integrate_style,"^respa"))
+    nlevels_respa = (dynamic_cast<Respa *>(update->integrate))->nlevels;
+
+  // Need a half neighbor list, built every Nevery steps
+  // from fix_bond_create.cpp
+  neighbor->add_request(this, NeighConst::REQ_OCCASIONAL);
+  lastcheck = -1;
+}
+
+/* ---------------------------------------------------------------------- */
+
+void FixTreadmilling::init_list(int /*id*/, NeighList *ptr)
+{
+  list = ptr;
 }
 
 /* ---------------------------------------------------------------------- */
 
 void FixTreadmilling::post_integrate()
 {
-  if (update->ntimestep % nevery != 0) return;
+  if (update->ntimestep % nevery) return;
+
   if (!has_creation_time) return;
 
   int ncreated_local = 0;
@@ -452,9 +486,9 @@ void FixTreadmilling::post_integrate()
 
 /* ---------------------------------------------------------------------- */
 
-void FixTreadmilling::post_integrate_respa(int ilevel, int iloop)
+void FixTreadmilling::post_integrate_respa(int ilevel, int /*iloop*/)
 {
-  if (ilevel == respa_level) post_integrate();
+  if (ilevel == nlevels_respa-1) post_integrate();
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1068,6 +1102,19 @@ void FixTreadmilling::rebuild_special_one(int m)
   nspecial[m][1] = cn2;
   nspecial[m][2] = cn3;
   memcpy(special[m],copy,cn3*sizeof(int));
+}
+
+/* ---------------------------------------------------------------------- */
+
+double FixTreadmilling::compute_vector(int n)
+{
+    if (n == 0) return (double) natoms;
+    if (n == 1) return (double) nbonds;
+    if (n == 2) return (double) nangles;
+    if (n == 3) return (double) natomstotal;
+    if (n == 4) return (double) nbondstotal;
+    if (n == 5) return (double) nanglestotal;
+    return 0.0;
 }
 
 /* ---------------------------------------------------------------------- */
