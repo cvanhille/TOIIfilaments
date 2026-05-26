@@ -34,11 +34,61 @@ class FixTreadmilling : public Fix {
   ~FixTreadmilling() override;
   int setmask() override;
   void init() override;
+  void init_list(int, class NeighList *) override; // From FixBondCreate -- keep?
   void post_integrate() override;
   void post_integrate_respa(int, int) override;
+
   int pack_forward_comm(int, int *, double *, int, int *) override;
   void unpack_forward_comm(int, int, double *) override;
+  int pack_reverse_comm(int, int, double *) override; // From FixBondCreate -- keep?
+  void unpack_reverse_comm(int, int *, double *) override; // From FixBondCreate -- keep?
+  void grow_arrays(int) override; // From FixBondCreate -- keep?
+  void copy_arrays(int, int, int) override; // From FixBondCreate -- keep?
+  int pack_exchange(int, double *) override; // From FixBondCreate -- keep?
+  int unpack_exchange(int, double *) override; // From FixBondCreate -- keep?
+  double compute_vector(int) override; // From FixBondCreate -- keep?
   double memory_usage() override;
+
+ protected: // ALL THESE FROM FixBondCreate -- keep????
+  int iatomtype, jatomtype;
+  int btype, seed;
+  int imaxbond, jmaxbond;
+  int inewtype, jnewtype;
+  int constrainflag, constrainpass;
+  double amin, amax;
+  double cutsq, fraction;
+  int atype, dtype, itype;
+  int angleflag, dihedralflag, improperflag;
+  int molecule_keyword;
+
+  int overflow;
+  tagint lastcheck;
+
+  int *bondcount;  // THIS I NEED TO KEEP IF I KEEP BONDCOUNT IN .cpp
+  int createcount, createcounttotal;
+  int nmax;
+  tagint *partner, *finalpartner;
+  double *distsq, *probability;
+
+  int ncreate, maxcreate;
+  tagint **created;  // THIS I NEED TO KEEP IF I KEEP CREATED IN .cpp
+
+  tagint *copy;  // THIS I NEED TO KEEP
+
+  class RanMars *random;  // THIS I NEED TO KEEP
+  class NeighList *list;  // THIS I NEED TO KEEP
+
+  int countflag, commflag;
+  int nlevels_respa;
+  int nangles, ndihedrals, nimpropers;
+
+  void check_ghosts();
+  void update_topology();
+  void rebuild_special_one(int);
+  void create_angles(int);
+  void create_dihedrals(int);
+  void create_impropers(int);
+  int dedup(int, int, tagint *);
 
  private:
   // Rates and parameters
@@ -63,11 +113,6 @@ class FixTreadmilling : public Fix {
   int birth_time_index;            // birth time property index -- to access birth times as `double *birth_time = atom->dvector[birth_time_index];`
   bool has_creation_time;          // flag if creation_time property exists
   int filpos_index;                // filamwent position property index -- to access filament positions as `int *filpos = atom->dvector[filpos_index];`
-
-  // Random number generation
-  class RanMars *random;
-  int seed;
-  int groupbit;           // bitmask for which atoms this fix applies to
 
   // Thermodynamic integration
   int respa_level;

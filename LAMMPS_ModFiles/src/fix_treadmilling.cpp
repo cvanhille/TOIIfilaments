@@ -64,29 +64,30 @@ Contributing Author: Christian Vanhille Campos (christian.vanhille@sorbonne-univ
 #include "fix_treadmilling.h"
 
 #include "atom.h"
-#include "atom_vec.h"
-#include "citeme.h"
 #include "comm.h"
-#include "compute.h"
-#include "domain.h"
 #include "error.h"
-#include "fix_bond_history.h"
 #include "force.h"
-#include "group.h"
-#include "input.h"
 #include "math_const.h"
-#include "math_extra.h"
 #include "memory.h"
 #include "modify.h"
-#include "molecule.h"
 #include "neigh_list.h"
 #include "neighbor.h"
 #include "pair.h"
 #include "random_mars.h"
-#include "reset_atoms_mol.h"
 #include "respa.h"
 #include "update.h"
-#include "variable.h"
+
+#include "molecule.h"
+// #include "atom_vec.h"
+// #include "citeme.h"
+// #include "compute.h"
+// #include "domain.h"
+// #include "fix_bond_history.h"
+// #include "group.h"
+// #include "input.h"
+// #include "math_extra.h"
+// #include "reset_atoms_mol.h"
+// #include "variable.h"
 
 #include <cctype>
 #include <cmath>
@@ -115,36 +116,51 @@ struct filbounds {
 
 /* ---------------------------------------------------------------------- */
 
-FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg)
-  : Fix(lmp, narg, arg), random(nullptr), nlocalkeep(nullptr), nghostlykeep(nullptr)
+FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
+  Fix(lmp, narg, arg), 
+  bondcount(nullptr), created(nullptr), copy(nullptr), random(nullptr), list(nullptr)
+  // random(nullptr), nlocalkeep(nullptr), nghostlykeep(nullptr)
 {
-  if (narg < 6) error->all(FLERR,"Illegal fix treadmilling command");
+  std::string fixname = fmt::format("fix {}", style);
+  if (narg < 6) utils::missing_cmd_args(FLERR, fixname, error);
 
-  // Default values
-  r_on = 0.0;
-  r_off_base = 0.0;
-  r_hyd = 0.0;
-  r_nuc = 0.0;
-  sigma = 1.0;
-  noise_sigma = 0.1;
-  max_trials = MAXTRIALS;
-  overlap_cut = 1.2;
+  nevery = utils::inumeric(FLERR,arg[3],false,lmp);  // how often to call this fix (in timesteps) -- inherited from fix.h in fix_treadmilling.h, no need to declare
+  if (nevery <= 0) error->all(FLERR, 3, "Illegal fix {} nevery value {}", style, nevery);
+
+  // Fix.h variables
+  dynamic_group_allow = 1;              // set to 1 because it can be used can be used with dynamic group
+  force_reneighbor = 1;                 // set to 1 so the fix forces reneighboring
+  next_reneighbor = -1;                 // next timestep to force a reneighboring -- set to -1 like in fix_bond_create.cpp
+  // this are straight from fix_bond_create -- NOT SURE WE NEED THEM
+  vector_flag = 1;                      // 0/1 if compute_vector() function exists -- NOT SURE WE NEED
+  size_vector = 2;                      // length of global vector -- NOT SURE WE NEED
+  global_freq = 1;                      // frequency s/v data is available at -- NOT SURE WE NEED
+  extvector = 0;                        // 0/1/-1 if global vector is all int/ext/extlist -- NOT SURE WE NEED
+
+  // Default values for fix parameters
+  // Kinetics: default to passive
+  r_on = 0.0;                           // growth rate (constant) -- default: no growth (passive)
+  r_off_base = 0.0;                     // off rate after hydrolysis (constant) -- default: no shrinking (passive)
+  r_hyd = 0.0;                          // hydrolysis rate (constant) -- default: no hydrolysis (passive)
+  r_nuc = 0.0;                          // nucleation rate (constant) -- default: no nucleation (passive)
+  nuc_mode = 0;                         // nucleation mode -- 0 no, 1 random, 2 branching
+  nucleator_type = -1;                  // branching particle type (if nuc_mode=2)
+  // Structure and algorithm
+  sigma = 1.0;                          // particle size
+  noise_sigma = 0.1;                    // creation position sampling noise magnitude
+  max_trials = MAXTRIALS;               // maximum # of trials allowed before giving up on creation
+  overlap_cut = 1.2;                    // overlap criterion distance (don't allow creation below this)
   
-  nuc_mode = 0;
-  nucleator_type = -1;
-  
-  particle_type = 1;
-  head_marker_type = -1;
-  tail_marker_type = -1;
+  // particle_type = 1;
+  // head_marker_type = -1;
+  // tail_marker_type = -1;
   
 //   creation_time_flag = -1;
 //   filament_id_flag = -1;
 //   filament_pos_flag = -1;
   
-  seed = 12345 + comm->me;
-  groupbit = group->bitmask[igroup];  // Set group bitmask
-  respa_level = -1;
-  nlevels_respa = 0;
+  seed = 12345;
+  nlevels_respa = 0;                    // from fix_bond_create.cpp / .h -- NOT SURE WE NEED
 
   // Initialize per-atom property pointers
 //   creation_time_data = nullptr;
@@ -172,6 +188,14 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg)
       if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling r_nuc");
       r_nuc = utils::numeric(FLERR,arg[iarg+1],false,lmp);
       iarg += 2;
+    } else if (strcmp(arg[iarg],"nuc_mode") == 0) {
+      if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling nuc_mode");
+      nuc_mode = utils::inumeric(FLERR,arg[iarg+1],false,lmp);
+      iarg += 2;
+    } else if (strcmp(arg[iarg],"nucleator_type") == 0) {
+      if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling nucleator_type");
+      nucleator_type = utils::inumeric(FLERR,arg[iarg+1],false,lmp);
+      iarg += 2;
     } else if (strcmp(arg[iarg],"sigma") == 0) {
       if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling sigma");
       sigma = utils::numeric(FLERR,arg[iarg+1],false,lmp);
@@ -180,17 +204,13 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg)
       if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling noise");
       noise_sigma = utils::numeric(FLERR,arg[iarg+1],false,lmp);
       iarg += 2;
-    } else if (strcmp(arg[iarg],"type") == 0) {
-      if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling type");
-      particle_type = utils::inumeric(FLERR,arg[iarg+1],false,lmp);
+    } else if (strcmp(arg[iarg],"maxtrials") == 0) {
+      if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling maxtrials");
+      max_trials = utils::inumeric(FLERR,arg[iarg+1],false,lmp);
       iarg += 2;
-    } else if (strcmp(arg[iarg],"nuc_mode") == 0) {
-      if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling nuc_mode");
-      nuc_mode = utils::inumeric(FLERR,arg[iarg+1],false,lmp);
-      iarg += 2;
-    } else if (strcmp(arg[iarg],"nucleator_type") == 0) {
-      if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling nucleator_type");
-      nucleator_type = utils::inumeric(FLERR,arg[iarg+1],false,lmp);
+    } else if (strcmp(arg[iarg],"overlap") == 0) {
+      if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling overlap");
+      overlap_cut = utils::numeric(FLERR,arg[iarg+1],false,lmp);
       iarg += 2;
     } else if (strcmp(arg[iarg],"seed") == 0) {
       if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling seed");
@@ -201,11 +221,58 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg)
     }
   }
 
-  // Create random number generator
-  random = new RanMars(lmp,seed);
+  // Print parameters
+  fprintf(lmp->screen, "\nfix treadmilling initialised!\n");
+  fprintf(lmp->screen, "  r_on        = %.2f\n", r_on);
+  fprintf(lmp->screen, "  r_off_base  = %.2f\n", r_off_base);
+  fprintf(lmp->screen, "  r_hyd       = %.2f\n", r_hyd);
+  fprintf(lmp->screen, "  r_hyd       = %.2f\n", r_hyd);
+  fprintf(lmp->screen, "  r_nuc       = %.2f\n", r_nuc);
+  fprintf(lmp->screen, "  nuc_mode    = %d\n", nuc_mode);
+  fprintf(lmp->screen, "  nuc_type    = %d\n", nucleator_type);
+  fprintf(lmp->screen, "  sigma       = %.2f\n", sigma);
+  fprintf(lmp->screen, "  noise_sigma = %.2f\n", noise_sigma);
+  fprintf(lmp->screen, "  max_trials  = %d\n", max_trials);
+  fprintf(lmp->screen, "  overlap_cut = %.2f\n", overlap_cut);
+  fprintf(lmp->screen, "  seed        = %d\n", seed);
+  fprintf(lmp->screen, "\n\n");
+
+  // initialize Marsaglia RNG with processor-unique seed
+  random = new RanMars(lmp, seed + comm->me);
 
   // Update squared cutoff distance
   overlap_sq = overlap_cut*overlap_cut;
+
+  // Perform initial allocation of atom-based arrays
+  // // register with Atom class
+  // // bondcount values will be initialized in setup()
+  bondcount = nullptr;
+  FixBondCreate::grow_arrays(atom->nmax);
+  atom->add_callback(Atom::GROW);
+  countflag = 0;
+  // // set comm sizes needed by this fix
+  // // forward is big due to comm of broken bonds and 1-2 neighbors
+  comm_forward = MAX(2,2+atom->maxspecial);
+  comm_reverse = 2;
+  // // allocate arrays local to this fix
+  nmax = 0;
+
+  maxcreate = 0;
+  created = nullptr;
+
+  // copy = special list for one atom
+  // size = ms^2 + ms is sufficient
+  // b/c in rebuild_special_one() neighs of all 1-2s are added,
+  //   then a dedup(), then neighs of all 1-3s are added, then final dedup()
+  // this means intermediate size cannot exceed ms^2 + ms
+
+  int maxspecial = atom->maxspecial;
+  copy = new tagint[maxspecial*maxspecial + maxspecial];
+
+  // zero out stats
+
+  createcount = 0;
+  createcounttotal = 0;
 }
 
 /* ---------------------------------------------------------------------- */
