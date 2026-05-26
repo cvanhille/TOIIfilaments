@@ -960,7 +960,7 @@ void FixTreadmilling::create_bond(tagint tagi, tagint tagj, int btype)
 int FixTreadmilling::delete_bonds(int idx)
 {
   // Delete all bonds involving particle idx
-  // This requires managing the bond list
+  // This requires managing the bond list - CAREFUL!
   if (!atom->avec->bonds_allow) return -1;
   if (idx < 0 || idx >= atom->nlocal) return -1;
 
