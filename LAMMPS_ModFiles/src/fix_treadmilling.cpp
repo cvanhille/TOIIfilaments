@@ -502,7 +502,16 @@ void FixTreadmilling::post_integrate_respa(int ilevel, int /*iloop*/)
   if (ilevel == nlevels_respa-1) post_integrate();
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   grow filament by creating new particle at head and updating bonds and angles accordingly
+     - find head position (from head index)
+     - sample new position near head
+      - displacement from head to subhead + noise (gaussian with magnitude noise_sigma)
+     - check overlaps and try again if necessary up to max_trials
+     - if successful, create new particle at that position and create bond and angle with previous head
+       - update head and subhead flags: new head is filpos 1, old head becomes subhead (filpos 2 if not tail, filpos 4 if also tail)
+       - set new particle properties (type, molecule ID, birth time, filpos) and tags (new tag = max tag + 1)
+------------------------------------------------------------------------- */
 
 void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
 {
@@ -588,6 +597,26 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
     return;
   }
 
+  // Update head and subhead flags
+    // Non-bulk particle filpos legend:
+    //   - Head: 1 always
+    //   - Subhead: 2 if pure subhead, 4 if subhead of dimer (also tail)
+    //   - Tail: 3 if pure tail, 4 if tail of dimer (also subhead)
+  // Head becomes subhead: 1 (always) -> 2 (becomes pure subhead)
+  if (filpos[hidx] != 1) {error->all(FLERR, "Fix treadmilling: head particle filpos value is not 1! Aborting! ");}
+  filpos[hidx] = 2;
+  // Subhead becomes either bulk (pure subhead case) - 2->0 - or pure tail (if was subhead of dimer, also tail) - 4->3
+  if (filpos[shidx] == 2) {
+    // Pure subhead becomes bulk
+    filpos[shidx] = 0;
+  } else if (filpos[shidx] == 4) {
+    // Subhead of dimer becomes tail of dimer
+    filpos[shidx] = 3;
+  }
+  else {
+    error->all(FLERR, "Fix treadmilling: subhead particle filpos value is not 2 or 4! Aborting! ");
+  }
+  
   // Create new particle
   //// Find new particle ID
   tagint new_tag = 0;
