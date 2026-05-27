@@ -380,10 +380,18 @@ void FixTreadmilling::post_integrate()
   // Ensure neighbor list is current for ghost atoms
   if (lastcheck <= neighbor->lastcall) check_ghosts();
 
+  // Acquire updated ghost atom positions
+  // necessary b/c are calling this after integrate, but before Verlet comm
+  comm->forward_comm();
+
   int ncreated_local = 0;
+  natomsloc = 0;
+  nbondsloc = 0;
+  nanglesloc = 0;
 
   double dt = update->dt;
   int nlocal = atom->nlocal;
+  int nall = atom->nlocal + atom->nghost;
 
   // Get unique molecule IDs to iterate over filaments
   int *tag = atom->tag;
@@ -424,7 +432,7 @@ void FixTreadmilling::post_integrate()
     //   - Tail: 3 if pure tail, 4 if tail of dimer (also subhead)
     if (k == 1) it->second.head_idx  = i;                   // head index
     if (k == 2 || k == 4) it->second.subhead_idx = i;       // subhead index
-    if (k == 3 || k == 4) it->second.tail_idx = i;          // subhead index
+    if (k == 3 || k == 4) it->second.tail_idx = i;          // tail index
   }
 
   // For each filament on this processor
@@ -432,6 +440,7 @@ void FixTreadmilling::post_integrate()
     auto hid = bounds.head_idx;
     auto tid = bounds.tail_idx;
     auto shid = bounds.subhead_idx;
+    
     // Growth event
     if (r_on > 0 && hid != -1) {
       double p_grow = r_on * dt;
@@ -506,8 +515,6 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
 
   // Sample new position near head
   double head_pos[3], shead_pos[3], new_pos[3];
-  int trials = 0;
-  bool placed = false;
   int hproc, shproc;
 
   // If current head owned by this processor define head position
@@ -537,15 +544,25 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
   MPI_Bcast(shead_pos, 3, MPI_DOUBLE, shproc, world);
 
   // Sample new position
+  int trials = 0;
+  bool placed = false;
   while (!placed && trials < max_trials) {
-    // Only sample new position on a main thread (rank 0)
+    // Only sample new position on main thread (rank 0)
     if (comm->me == 0) {
       // Displacement
       double dx = head_pos[0] - shead_pos[0];
       double dy = head_pos[1] - shead_pos[1];
       double dz = head_pos[2] - shead_pos[2];
       double len = sqrt(dx*dx+dy*dy+dz*dz);
-      if (len > 0) {dx /= len; dy /= len; dz /= len;}
+      if (len > 1e-10) {dx /= len; dy /= len; dz /= len;}
+      else {
+          // fallback: random unit vector if head and shead coincide
+          dx = random->gaussian();
+          dy = random->gaussian();
+          dz = random->gaussian();
+          len = sqrt(dx*dx+dy*dy+dz*dz);
+          dx /= len; dy /= len; dz /= len;
+      }
       // New position
       new_pos[0] = head_pos[0] + dx + noise_sigma * random->gaussian();
       new_pos[1] = head_pos[1] + dy + noise_sigma * random->gaussian();
@@ -559,8 +576,8 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
     if (!check_overlap(new_pos)) {placed=true;}
     trials++;
   }
-
-  if (!placed) {      // return early if failed placement
+  
+  if (!placed && comm->me == 0) {      // return early if failed placement
     error->warning(FLERR, "Fix treadmilling: failed particle placement in filament growth. ");
     return;
   }
@@ -578,6 +595,14 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
   if (domain->is_local(new_pos)) {
     create_particle(new_pos, new_tag, create_type, mol_id, 1);
   }
+  // Increment local count of created particles
+  natomsloc++;
+
+  // Forward communicate new particle position for bond creation
+  comm->forward_comm(this);
+
+  // Rebuild neighbor list for bond creation
+  neighbor->build_one(list);
 
   // Create bonds
   // TO-DO
@@ -770,10 +795,13 @@ bool FixTreadmilling::in_this_proc(double *pos)
 bool FixTreadmilling::check_overlap(double *pos)
 {
   double **x = atom->x;
-  int nlocal = atom->nlocal;
+  // int nlocal = atom->nlocal;
+  int ntotal = atom->nlocal + atom->nghost;
   int flag = 0;
-  double delx, dely, delz;
-  for (i = 0; i < nlocal; i++) {
+  double delx, dely, delz, rsq;
+  int i;
+  // for (i = 0; i < nlocal; i++) {
+  for (i = 0; i < ntotal; i++) {
     delx = pos[0] - x[i][0];
     dely = pos[1] - x[i][1];
     delz = pos[2] - x[i][2];
@@ -783,11 +811,21 @@ bool FixTreadmilling::check_overlap(double *pos)
   }
   int flagall = 0;
   MPI_Allreduce(&flag, &flagall, 1, MPI_INT, MPI_MAX, world);
-  if (flagall == 0) {return false;}
-  else {return true;}
+  return flagall > 0;  // true = overlap detected, false = safe to place
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   insert a new particle at position pos with given tag, type, molecule id, and filpos
+    uses atom->avec->create_atom to insert
+    sets tag, mol_id and mask
+    sets velocity from Boltzmann distribution
+    sets forces to zero
+    sets the image flag to zero (remapped, standard procedure)
+    sets special properties:
+      fp given when calling function
+      birth time = current timestep (update->ntimestep)
+    updates atom map at the end so new atom is findable immediately
+------------------------------------------------------------------------- */
 
 void FixTreadmilling::create_particle(double *pos, tagint tag, int type_id, tagint mol_id, int fp)
 {
@@ -810,7 +848,16 @@ void FixTreadmilling::create_particle(double *pos, tagint tag, int type_id, tagi
   atom->v[nlocal][0] = boltzfac * random->gaussian();
   atom->v[nlocal][1] = boltzfac * random->gaussian();
   atom->v[nlocal][2] = boltzfac * random->gaussian();
+
+  // Zero the force on the new atom
+  atom->f[nlocal][0] = 0.0;
+  atom->f[nlocal][1] = 0.0;
+  atom->f[nlocal][2] = 0.0;
   
+  // Set the image flags to 0 for new atom
+  atom->image[nlocal] = ((imageint) IMGMAX << IMG2BITS) |
+                      ((imageint) IMGMAX << IMGBITS) | IMGMAX;
+
   // Per-atom custom properties
   if (has_creation_time) {atom->dvector[birth_time_index][nlocal] = update->ntimestep;}
   atom->ivector[filpos_index][nlocal] = fp;
@@ -867,7 +914,7 @@ void FixTreadmilling::create_bond(tagint tagi, tagint tagj, int btype)
     bond_atom[i1][nb] = tag2;
     bond_type[i1][nb] = btype;
     num_bond[i1]++;
-    ncreate++;
+    nbondsloc++;
   }
   
   if (i2 >= 0 && i2 < atom->nlocal && !newton_bond) {

@@ -64,6 +64,7 @@ class FixTreadmilling : public Fix {
   int nlevels_respa;                               // number of RESPA levels if integrator is RESPA
   
   int natoms, nbonds, nangles;                     // number of atoms, bonds and angles created in this timestep
+  int natomsloc, nbondsloc, nanglesloc;            // number of atoms, bonds and angles created in this timestep -- local count for this processor
   int natomstotal, nbondstotal, nanglestotal;      // cumulative number of atoms, bonds and angles created
 
   void check_ghosts();                             // ensure ghost atoms have correct partner info after communication -- adapted from fix_bond_create.cpp
