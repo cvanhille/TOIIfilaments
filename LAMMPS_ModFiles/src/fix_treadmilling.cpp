@@ -375,7 +375,9 @@ void FixTreadmilling::post_integrate()
 {
   if (update->ntimestep % nevery) return;
 
-  if (!has_creation_time) return;
+  if (!has_creation_time) 
+    error->all(FLERR, Error::NOLASTLINE,
+               "Fix {} could not find any creation/birth time property. Aborting... Please revise!", style);
 
   // Ensure neighbor list is current for ghost atoms
   if (lastcheck <= neighbor->lastcall) check_ghosts();
@@ -444,8 +446,7 @@ void FixTreadmilling::post_integrate()
     
     // Growth event
     if (r_on > 0) {
-      double p_grow = r_on * dt;
-      if (random->uniform() < p_grow) {
+      if (should_happen(r_on)) {
         // Grow filament - takes care of everything: sampling new position, checking overlaps, creating particle, bonds and angles, and updating head and subhead flags
         grow_filament(mol_id, hid, shid);
       }
@@ -454,8 +455,9 @@ void FixTreadmilling::post_integrate()
     // Shrinkage event
     if (r_off_base > 0.0) {
       double tage = (update->ntimestep - birth_step[tid]) * dt;
-      double p_shrink = compute_shrinkage_rate(tage) * dt;
-      if (random->uniform() < p_shrink) {
+      double shrink_rate = compute_shrinkage_rate(tage);
+      if (should_happen(shrink_rate)) {
+        // Shrink filament -- takes care of everything: deleting particles, bonds and angles and updating flags
         shrink_filament(tid);
       }
     }
@@ -463,37 +465,18 @@ void FixTreadmilling::post_integrate()
 
   // Nucleation of new filaments
   if (r_nuc > 0.0) {
-    did_nucleate = 0;
-    if (comm->me == 0) {
-      double p_nuc = r_nuc * dt;
-      if (random->uniform() < p_nuc) {
-        // Update nucleation flag
-        did_nucleate = 1;
-      }
-    }
-    MPI_Bcast(&did_nucleate, 1, MPI_INT, 0, world);
-    if (did_nucleate) {
+    if (should_happen(r_nuc)) {
       if (nuc_mode == 1) {
+        // Nucleate a new filament with random position and orientation
+        // takes care of everything: creating particles and bond and setting flags
         nucleate_filament();
-        ncreated_local += 2;
       } else if (nuc_mode == 2 && nucleator_type > 0) {
         // TO-DO: Implement branching
-        // nucleate_branch();
-        // // Find random nucleator particle // REVISE THIS
-        // for (int i = 0; i < nlocal; i++) {
-        //   if (type[i] == nucleator_type && random->uniform() < p_nuc / nlocal) {
-        //     nucleate_branch(i);
-        //     break;
-        //   }
-        // }
+        // placeholder:
+        error->all(FLERR, "Fix treadmilling: branching not implemented yet but called for! Please revise! ");
       }
     }
-  }
-
-  // Get global creations
-  int ncreated_global = 0;
-  MPI_Allreduce(&ncreated_local, &ncreated_global, 1, MPI_INT, MPI_SUM, world);
-  atom->natoms += ncreated_global;
+  } // end of nucleation if
 }
 
 /* ---------------------------------------------------------------------- */
@@ -849,6 +832,27 @@ bool FixTreadmilling::check_overlap(double *pos)
   int flagall = 0;
   MPI_Allreduce(&flag, &flagall, 1, MPI_INT, MPI_MAX, world);
   return flagall > 0;  // true = overlap detected, false = safe to place
+}
+
+/* ---------------------------------------------------------------------- 
+  check if a rate-controlled event occurs based on the rate and timestep
+    returns true if event occurs, false otherwise
+    uses random number generator to determine outcome
+    only run RNG on one processor (rank 0) 
+    broadcast result to ensure consistency across ranks
+------------------------------------------------------------------------- */
+
+bool FixTreadmilling::should_happen(double rate)
+{
+  int should = 0;
+  if (comm->me == 0) {
+    double prob = rate * update->dt;
+    if (random->uniform() < prob) {
+      should = 1;
+    }
+  }
+  MPI_Bcast(&should, 1, MPI_INT, 0, world);
+  return should == 1;
 }
 
 /* ----------------------------------------------------------------------
