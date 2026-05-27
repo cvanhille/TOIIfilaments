@@ -435,14 +435,15 @@ void FixTreadmilling::post_integrate()
     if (k == 3 || k == 4) it->second.tail_idx = i;          // tail index
   }
 
-  // For each filament on this processor
+  // For each filament (molecule ID), attempt growth and shrinkage events 
+  //   at head and tail respectively with probabilities based on rates and timestep
   for (auto& [mol_id, bounds] : filament_bounds) {
     auto hid = bounds.head_idx;
     auto tid = bounds.tail_idx;
     auto shid = bounds.subhead_idx;
     
     // Growth event
-    if (r_on > 0 && hid != -1) {
+    if (r_on > 0) {
       double p_grow = r_on * dt;
       if (random->uniform() < p_grow) {
         // Grow filament - takes care of everything: sampling new position, checking overlaps, creating particle, bonds and angles, and updating head and subhead flags
@@ -451,7 +452,7 @@ void FixTreadmilling::post_integrate()
     }
 
     // Shrinkage event
-    if (r_off_base > 0.0 && tid != -1) {
+    if (r_off_base > 0.0) {
       double tage = (update->ntimestep - birth_step[tid]) * dt;
       double p_shrink = compute_shrinkage_rate(tage) * dt;
       if (random->uniform() < p_shrink) {
@@ -511,6 +512,7 @@ void FixTreadmilling::post_integrate_respa(int ilevel, int /*iloop*/)
      - if successful, create new particle at that position and create bond and angle with previous head
        - update head and subhead flags: new head is filpos 1, old head becomes subhead (filpos 2 if not tail, filpos 4 if also tail)
        - set new particle properties (type, molecule ID, birth time, filpos) and tags (new tag = max tag + 1)
+    needs to be called by all processors - handles rank locality and communications internally
 ------------------------------------------------------------------------- */
 
 void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
