@@ -445,7 +445,7 @@ void FixTreadmilling::post_integrate()
     if (r_on > 0 && hid != -1) {
       double p_grow = r_on * dt;
       if (random->uniform() < p_grow) {
-        // Grow filament
+        // Grow filament - takes care of everything: sampling new position, checking overlaps, creating particle, bonds and angles, and updating head and subhead flags
         grow_filament(mol_id, hid, shid);
       }
     }
@@ -616,7 +616,7 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
   else {
     error->all(FLERR, "Fix treadmilling: subhead particle filpos value is not 2 or 4! Aborting! ");
   }
-  
+
   // Create new particle
   //// Find new particle ID
   tagint new_tag = 0;
