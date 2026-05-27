@@ -384,10 +384,10 @@ void FixTreadmilling::post_integrate()
   // necessary b/c are calling this after integrate, but before Verlet comm
   comm->forward_comm();
 
-  int ncreated_local = 0;
-  natomsloc = 0;
-  nbondsloc = 0;
-  nanglesloc = 0;
+  // Zero global creation counts for this timestep
+  natoms = 0;
+  nbonds = 0;
+  nangles = 0;
 
   double dt = update->dt;
   int nlocal = atom->nlocal;
@@ -447,7 +447,6 @@ void FixTreadmilling::post_integrate()
       if (random->uniform() < p_grow) {
         // Grow filament
         grow_filament(mol_id, hid, shid);
-        ncreated_local++;
       }
     }
 
@@ -507,11 +506,18 @@ void FixTreadmilling::post_integrate_respa(int ilevel, int /*iloop*/)
 
 void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
 {
+  // zero local count of created particles for this growth event
+  natomsloc = 0;
+
   int nlocal = atom->nlocal;
   int *molecule = atom->molecule;
   double **x = atom->x;
+  tagint *tag = atom->tag;
   int *type = atom->type;
   int *filpos = atom->ivector[filpos_index];
+
+  // Head tag
+  tagint head_tag = tag[hidx];
 
   // Sample new position near head
   double head_pos[3], shead_pos[3], new_pos[3];
@@ -597,6 +603,9 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
   }
   // Increment local count of created particles
   natomsloc++;
+  // Broadcast particle count
+  MPI_Allreduce(&natomsloc, &natoms, 1, MPI_INT, MPI_SUM, world);
+  if (natoms > 1) {error->warning(FLERR, "Created more than one particle in fix treadmilling grow_filament! Revise implementation!!");}
 
   // Forward communicate new particle position for bond creation
   comm->forward_comm(this);
@@ -604,11 +613,8 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
   // Rebuild neighbor list for bond creation
   neighbor->build_one(list);
 
-  // Create bonds
-  // TO-DO
-
-  // Create angles
-  // TO-DO
+  // Create bonds (handles creation of angles too)
+  create_bond(new_tag, head_tag, btype);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -878,10 +884,20 @@ void FixTreadmilling::delete_particle(int idx)
   atom->nlocal--;
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   create a new bond between atoms with given tags and bond type
+    sets up bond_atom and bond_type arrays for the two atoms involved, consistent with newton_bond setting
+    updates special neighbor lists for the two atoms involved to add 1-2 neighbor relationship
+    forward comm all specials to ensure ghost atoms have updated bond info
+    updates topology (like in fix_bond_create) to add new bond and any resulting angles
+    updates new bond counts and checks for consistency
+------------------------------------------------------------------------- */
 
 void FixTreadmilling::create_bond(tagint tagi, tagint tagj, int btype)
 {
+  // reset local bond count for this creation event
+  nbondsloc = 0;
+
   // Order atoms by tag
   tagint tag1, tag2;
   if (tagi <= tagj) {tag1 = tagi; tag2 = tagj;}
@@ -899,9 +915,8 @@ void FixTreadmilling::create_bond(tagint tagi, tagint tagj, int btype)
   tagint **special = atom->special;
   int *mask = atom->mask;
   int *type = atom->type;
-  int num_bond = atom->num_bond;
+  int *num_bond = atom->num_bond;
   int newton_bond = force->newton_bond;
-  int ncreate = 0;
   
   // Update bond_atom and bond_type for atoms 1 and 2 consistently whatever processor they're on
   // If newton_bond is set, only store bond on atom 1 (smaller tag)
@@ -914,7 +929,7 @@ void FixTreadmilling::create_bond(tagint tagi, tagint tagj, int btype)
     bond_atom[i1][nb] = tag2;
     bond_type[i1][nb] = btype;
     num_bond[i1]++;
-    nbondsloc++;
+    nbondsloc++;                                    // only count bond creation on owning processor to avoid double counting when newton_bond=0
   }
   
   if (i2 >= 0 && i2 < atom->nlocal && !newton_bond) {
@@ -958,7 +973,7 @@ void FixTreadmilling::create_bond(tagint tagi, tagint tagj, int btype)
   if (i2 >= 0 && i2 < atom->nlocal) {
     int n1 = nspecial[i2][0];
     int n3 = nspecial[i2][2];
-    if (n3 >= atom-maxspecial) {error->one(FLERR, "Special neighbor list overflow in fix treadmilling");}
+    if (n3 >= atom->maxspecial) {error->one(FLERR, "Special neighbor list overflow in fix treadmilling");}
     
     bool already_there = false;
     for (int k = 0; k < n3; k++) {
@@ -981,25 +996,17 @@ void FixTreadmilling::create_bond(tagint tagi, tagint tagj, int btype)
   // Forward comm all specials so ghost atoms have updated bond info
   comm->forward_comm(this);
 
-  // Update bonded special neighbours beyond 1-2 neighs consistently across processors
-  // Using rebuild_special_one directly from fix_bond_create.cpp
-  rebuild_special_one(i1);
-  rebuild_special_one(i2);
+  // Update topology (like in fix_bond_create but for a single bond)
+  // this will handle any necessary updates to angles as well as special neighbor lists beyond 1-2
+  update_topology(tag1, tag2); 
   
   // Safely update global bond count via MPI reduction
-  int ncreate_global = 0;
-  MPI_Allreduce(&ncreate, &ncreate_global, 1, MPI_INT, MPI_SUM, world);
-  if (ncreate_global > 1) {error->warning(FLERR, "Created more than one bond in fix treadmilling! Revise implementation!!");}
-  atom->nbonds += ncreate_global;
+  MPI_Allreduce(&nbondsloc, &nbonds, 1, MPI_INT, MPI_SUM, world);
+  if (nbonds > 1) {error->warning(FLERR, "Created more than one bond in fix treadmilling create_bond! Revise implementation!!");}
+  atom->nbonds += nbonds;
 
   // Trigger reneigbouring if any bonds were formed
-  if (ncreate_global > 0) next_reneighbor = update->ntimestep;
-  
-  // TODO: Optional topology rebuild
-  // If angles are enabled and atype is set, rebuild special lists for i1 and i2
-  // and create angles involving the new bond
-  // This would follow the pattern from FixBondCreate::update_topology()
-  // For now, skip if treadmilling doesn't use angles
+  if (nbonds > 0) next_reneighbor = update->ntimestep;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1084,19 +1091,19 @@ void FixTreadmilling::check_ghosts()
 }
 
 /* ----------------------------------------------------------------------
-   double loop over my atoms and created bonds
-   influenced = 1 if atom's topology is affected by any created bond
-     yes if is one of 2 atoms in bond
+   loop over my atoms and compare with created bond endpoints to determine if special list needs to be rebuilt
+   influenced = 1 if atom's topology is affected by the created bond between id1 and id2, which means:
+     yes if is one of 2 atoms in bond (id1 or id2)
      yes if either atom ID appears in as 1-2 or 1-3 in atom's special list
      else no
-   if influenced by any created bond:
+   if influenced, then:
      rebuild the atom's special list of 1-2,1-3,1-4 neighs
      check for angles to create due modified special list
 
   ADAPTED FROM fix_bond_create.cpp
 ------------------------------------------------------------------------- */
 
-void FixTreadmilling::update_topology()
+void FixTreadmilling::update_topology(tagint id1, tagint id2)
 {
   int i,j,k,n,influence,influenced;                                   // influence = does this atom "touch" a newly created bond?; influenced = does this atom touch any newly created bond?
   tagint id1,id2;
@@ -1114,23 +1121,16 @@ void FixTreadmilling::update_topology()
     influenced = 0;                                                   // reset per atom i, before looping over all new bonds
     slist = special[i];
 
-    for (j = 0; j < ncreate; j++) {
-      id1 = created[j][0];
-      id2 = created[j][1];
-
-      influence = 0;
-      // compute influence of bond j on atom i
-      if (tag[i] == id1 || tag[i] == id2) influence = 1;              // atom i IS one of the bond endpoints
-      else {
-        n = nspecial[i][1];                                           // number of 1-3 neighbors (angle partners)
-        for (k = 0; k < n; k++)
-          if (slist[k] == id1 || slist[k] == id2) {                   // atom i is a 1-3 neighbor of a bond endpoint
-            influence = 1;
-            break;
-          }
-      }
-      if (!influence) continue;
-      influenced = 1;                                                 // at least one bond affected atom i
+    influence = 0;
+    // compute influence of bond j on atom i
+    if (tag[i] == id1 || tag[i] == id2) influenced = 1;               // atom i IS one of the bond endpoints (id1 or id2)
+    else {
+      n = nspecial[i][1];                                             // number of 1-3 neighbors (angle partners)
+      for (k = 0; k < n; k++)
+        if (slist[k] == id1 || slist[k] == id2) {                     // atom i is a 1-3 neighbor of a bond endpoint (id1 or id2) -> it's influenced by the bond creation
+          influenced = 1;
+          break;
+        }
     }
 
     // rebuild_special_one() first, since used by create_angles, etc
