@@ -44,7 +44,7 @@ class FixTreadmilling : public Fix {
   double memory_usage() override;
 
  protected:
-  int ptype, btype, atype                          // particle type, bond type and angle type to create
+  int ptype, btype, atype;                          // particle type, bond type and angle type to create
 
   int seed;                                        // RNG seed
 
@@ -93,6 +93,9 @@ class FixTreadmilling : public Fix {
   tagint MAX_TAG;
   tagint MAX_MOL;
 
+  // Temperature
+  double temp;                                                    // system temperature, for velocity initialization during creation - assumed constant and uniform for now, but could be made more complex in the future by accessing compute_temp or similar
+
   // Helper methods
   void grow_filament(tagint, int, int);                           // add particle at head of filament i
   void shrink_filament(int);                                      // remove particle from tail of filament i
@@ -108,6 +111,8 @@ class FixTreadmilling : public Fix {
   int delete_bonds(int);                                          // delete bonds involving particle i, return index for bound particle (index for subtail which become new tail)
   
   double compute_shrinkage_rate(double);                          // compute r_off(lifetime) = r_0(1-exp(-r_hyd*lifetime))
+
+  bool is_local(double *);                                        // check if position is local to this processor
 };
 
 }  // namespace LAMMPS_NS

@@ -64,12 +64,15 @@ Contributing Author: Christian Vanhille Campos (christian.vanhille@sorbonne-univ
 #include "fix_treadmilling.h"
 
 #include "atom.h"
+#include "atom_vec.h"
 #include "comm.h"
+#include "domain.h"
 #include "error.h"
 #include "force.h"
 #include "math_const.h"
 #include "memory.h"
 #include "modify.h"
+#include "molecule.h"
 #include "neigh_list.h"
 #include "neighbor.h"
 #include "pair.h"
@@ -77,8 +80,6 @@ Contributing Author: Christian Vanhille Campos (christian.vanhille@sorbonne-univ
 #include "respa.h"
 #include "update.h"
 
-#include "molecule.h"
-// #include "atom_vec.h"
 // #include "citeme.h"
 // #include "compute.h"
 // #include "domain.h"
@@ -118,7 +119,7 @@ struct filbounds {
 
 FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
   Fix(lmp, narg, arg), 
-  bondcount(nullptr), copy(nullptr), random(nullptr), list(nullptr)
+  copy(nullptr), random(nullptr), list(nullptr)
 {
   std::string fixname = fmt::format("fix {}", style);
   if (narg < 6) utils::missing_cmd_args(FLERR, fixname, error);
@@ -151,6 +152,7 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
   ptype = 1;                            // particle type to create -- default: type 1
   btype = 1;                            // bond type to create -- default: type 1
   atype = 1;                            // angle type to create -- default: type 1
+  temp = 1.0;                           // temperature for velocity initialization during creation -- default: 1.0
   
   seed = 12345;
   nlevels_respa = 0;                    // from fix_bond_create.cpp / .h
@@ -202,6 +204,10 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
       if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling overlap");
       overlap_cut = utils::numeric(FLERR,arg[iarg+1],false,lmp);
       iarg += 2;
+    } else if (strcmp(arg[iarg],"temp") == 0) {
+      if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling temp");
+      temp = utils::numeric(FLERR,arg[iarg+1],false,lmp);
+      iarg += 2;
     } else if (strcmp(arg[iarg],"ptype") == 0) {
       if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling ptype");
       ptype = utils::inumeric(FLERR,arg[iarg+1],false,lmp);
@@ -240,6 +246,7 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
   fprintf(lmp->screen, "  btype        = %d\n", btype);
   fprintf(lmp->screen, "  atype        = %d\n", atype);
   fprintf(lmp->screen, "  seed        = %d\n", seed);
+  fprintf(lmp->screen, "  temp        = %.2f\n", temp);
   fprintf(lmp->screen, "\n\n");
 
   // Error check
@@ -339,7 +346,7 @@ void FixTreadmilling::init()
 
   // Check for angle style
   if (force->angle == nullptr)
-    error-all(FLERR, "Fix treadmilling requires an angle style");
+    error->all(FLERR, "Fix treadmilling requires an angle style");
 
   // Check for RESPA and get number of RESPA levels if so
   if (utils::strmatch(update->integrate_style,"^respa"))
@@ -417,7 +424,7 @@ void FixTreadmilling::post_integrate()
     // Insert with sentinel values if not yet seen
     auto it = filament_bounds.find(m);
     if (it == filament_bounds.end()) {
-      it = filament_bounds.emplace(m, filbounds{-1, -1, -1, -1}).first;
+      it = filament_bounds.emplace(m, filbounds{-1, -1, -1}).first;
     }
     // Set index when special non-bulk particle found
     // Non-bulk particle filpos legend:
@@ -517,7 +524,7 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
   // If current head owned by this processor define head position
   int hproc_loc = -1;
   if (hidx != -1) {
-    if (domain->is_local(x[hidx])) {
+    if (is_local(x[hidx])) {
       head_pos[0] = x[hidx][0]; head_pos[1] = x[hidx][1]; head_pos[2] = x[hidx][2];
       hproc_loc = comm->me;
     }
@@ -530,7 +537,7 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
   // If current subhead owned by this processor define subhead position
   int shproc_loc = -1;
   if (shidx != -1) {
-    if (domain->is_local(x[shidx])) {
+    if (is_local(x[shidx])) {
       shead_pos[0] = x[shidx][0]; shead_pos[1] = x[shidx][1]; shead_pos[2] = x[shidx][2];
       shproc_loc = comm->me;
     }
@@ -612,8 +619,8 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
   MPI_Bcast(&new_tag, 1, MPI_LMP_TAGINT, 0, world);
   MAX_TAG = new_tag; // Global update of MAX_TAG -- executed by all processors after broadcast
   //// Locally create particle, if rank owns position of new particle
-  if (domain->is_local(new_pos)) {
-    create_particle(new_pos, new_tag, create_type, mol_id, 1);
+  if (is_local(new_pos)) {
+    create_particle(new_pos, new_tag, ptype, mol_id, 1);
   }
   // Increment local count of created particles
   natomsloc++;
@@ -639,7 +646,7 @@ void FixTreadmilling::shrink_filament(int tail_idx)
   int *filpos = atom->ivector[filpos_index];
   // Delete bonds involving tail_idx (should be a single one) and return the index of the bound particle (new tail)
   int stidx = delete_bonds(tail_idx);
-  if (stidx == -1) {error->all(FLERR, "Fix treadmilling: invalid bound particle index upon tail depolymerisation. ")}
+  if (stidx == -1) {error->all(FLERR, "Fix treadmilling: invalid bound particle index upon tail depolymerisation. ");}
   // If dimer remove all, if not change filpos os subtail
   bool dimer = false;
   if (filpos[tail_idx] == 4) {
@@ -742,16 +749,16 @@ void FixTreadmilling::nucleate_filament()
   MAX_TAG = new_tag_2; // Global update of MAX_TAG -- executed on all processors after broadcast
 
   //// Locally create particles
-  if (domain->is_local(pos1)) {
+  if (is_local(pos1)) {
     // If rank owns position of tail it creates tail
     int tail_fp = 4;                                                    // tail has filpos = 4 in dimer
-    create_particle(pos1, new_tag_1, create_type, new_mol_id, tail_fp);
+    create_particle(pos1, new_tag_1, ptype, new_mol_id, tail_fp);
     natomsloc++;                                                        // increment local count of created particles
   }
-  if (domain->is_local(pos2)) {
+  if (is_local(pos2)) {
     // If rank owns position of head it creates head
     int head_fp = 1;                                                    // head has filpos = 1 always, including in dimer
-    create_particle(pos2, new_tag_2, create_type, new_mol_id, head_fp);
+    create_particle(pos2, new_tag_2, ptype, new_mol_id, head_fp);
     natomsloc++;                                                        // increment local count of created particles
   }
 
@@ -799,8 +806,7 @@ void FixTreadmilling::nucleate_branch(int nucleator_idx)
         pos2[0] >= domain->boxlo[0] && pos2[0] <= domain->boxhi[0] &&
         pos2[1] >= domain->boxlo[1] && pos2[1] <= domain->boxhi[1] &&
         pos2[2] >= domain->boxlo[2] && pos2[2] <= domain->boxhi[2]) {
-      int dummy;
-      if (!check_overlap(pos1, -1, dummy) && !check_overlap(pos2, -1, dummy)) {
+      if (!check_overlap(pos1) && !check_overlap(pos2)) {
         placed = true;
       }
     }
@@ -811,9 +817,9 @@ void FixTreadmilling::nucleate_branch(int nucleator_idx)
     int nlocal = atom->nlocal;
     tagint mol_id = ++mol_counter;  // Simple molecule ID counter
     
-    create_particle(pos1, particle_type, mol_id);
-    create_particle(pos2, particle_type, mol_id);
-    create_bonds(nlocal, nlocal + 1);
+    create_particle(pos1, mol_id, ptype, mol_id, 1);
+    create_particle(pos2, mol_id, ptype, mol_id, 1);
+    create_bond(nlocal, nlocal + 1, btype);
   }
 }
 
@@ -994,7 +1000,7 @@ void FixTreadmilling::create_bond(tagint tagi, tagint tagj, int btype)
   if (i1 >= 0 && i1 < atom->nlocal) {
     int n1 = nspecial[i1][0];  // current number of 1-2 neighbors
     int n3 = nspecial[i1][2];  // current number of 1-4 neighbors
-    if (n3 >= atom-maxspecial) {error->one(FLERR, "Special neighbor list overflow in fix treadmilling");}
+    if (n3 >= atom->maxspecial) {error->one(FLERR, "Special neighbor list overflow in fix treadmilling");}
     
     // Check if tag2 already in special list -- should not be the case as typically follows particle creation
     bool already_there = false;
@@ -1163,7 +1169,6 @@ void FixTreadmilling::check_ghosts()
 void FixTreadmilling::update_topology(tagint id1, tagint id2)         // by convention in create_bond, id1 < id2 -- so id1 is central atom for angle creation and id2 is the new neighbor being added
 {
   int i,j,k,n,influence,influenced;                                   // influence = does this atom "touch" a newly created bond?; influenced = does this atom touch any newly created bond?
-  tagint id1,id2;
   tagint *slist;
 
   tagint *tag = atom->tag;
@@ -1412,6 +1417,15 @@ void FixTreadmilling::create_angle(int m, tagint id1, tagint id2)
   }
 
   atom->num_angle[m] = num_angle;
+}
+
+/* ---------------------------------------------------------------------- */
+
+bool FixTreadmilling::is_local(double *pos)
+{
+    return (pos[0] >= domain->sublo[0] && pos[0] < domain->subhi[0] &&
+            pos[1] >= domain->sublo[1] && pos[1] < domain->subhi[1] &&
+            pos[2] >= domain->sublo[2] && pos[2] < domain->subhi[2]);
 }
 
 /* ---------------------------------------------------------------------- */
