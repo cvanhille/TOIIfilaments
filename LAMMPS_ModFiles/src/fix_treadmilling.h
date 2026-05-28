@@ -51,16 +51,11 @@ class FixTreadmilling : public Fix {
   int overflow;                                    // flag set if new bonds/angles overflow the per-atom storage
   tagint lastcheck;                                // timestep of last ghost-distance check; used by check_ghosts()
 
-//   tagint **created;  // THIS I NEED TO KEEP IF I KEEP CREATED IN .cpp
-  tagint **created_bonds;                          // array of created bond pairs ([tag_i, tag_j]) - used to update special lists and angle creation -- INSTEAD of created from fix bond/create
-  int ncreated_bonds, maxcreated_bonds;            // created bonds counter (for created_bonds array) and allocated size capacity
-
   tagint *copy;                                    // temporary buffer used when rebuilding an atom’s special neighbor list
 
   class RanMars *random;                           // RNG object
   class NeighList *list;                           // pointer to the neighbor list assigned via init_list() - needed for neighbor-list callbacks
 
-  int commflag;                                    // selects which data is packed/unpacked during communication
   int nlevels_respa;                               // number of RESPA levels if integrator is RESPA
   
   int natoms, nbonds, nangles;                     // number of atoms, bonds and angles created in this timestep
@@ -68,44 +63,35 @@ class FixTreadmilling : public Fix {
   int natomstotal, nbondstotal, nanglestotal;      // cumulative number of atoms, bonds and angles created
 
   void check_ghosts();                             // ensure ghost atoms have correct partner info after communication -- adapted from fix_bond_create.cpp
-  void update_topology();                          // 
-  void rebuild_special_one(int);
-  void create_angles(int);
-  void create_dihedrals(int);
-  void create_impropers(int);
-  int dedup(int, int, tagint *);
+  void update_topology(tagint, tagint);            // check local atoms influence by new bond creation and update special lists accordingly -- adapted from fix_bond_create.cpp 
+  void rebuild_special_one(int);                   // re-build special list of atom i -- called by update_topology -- adapted from fix_bond_create.cpp
+  void create_angle(int, tagint, tagint);          // create any angles owned by atom i induced by newly created bonds (involving i1 and i3) -- adapted from fix_bond_create.cpp
+  int dedup(int, int, tagint *);                   // remove all ID duplicates in copy -- called by rebuild_special_one -- adapted from fix_bond_create.cpp
 
  private:
   // Rates and parameters
-  double r_on;            // growth rate (particles/time)
-  double r_off_base;      // base shrinkage rate r_0 (1/time)
-  double r_hyd;           // hydrolysis rate (1/time)
-  double r_nuc;           // nucleation rate for new filaments
-  double sigma;           // bond length / monomer size
-  double noise_sigma;     // standard deviation of noise in placement
-  int max_trials;         // max attempts to find non-overlapping position
-  double overlap_cut;     // cutoff distance for overlap checking
-  double overlap_sq;      // squared overlap distance
+  double r_on;                                     // growth rate (particles/time)
+  double r_off_base;                               // base shrinkage rate r_0 (1/time)
+  double r_hyd;                                    // hydrolysis rate (1/time)
+  double r_nuc;                                    // nucleation rate for new filaments (filaments/time)
+  double sigma;                                    // bond length / monomer size
+  double noise_sigma;                              // standard deviation of noise in placement
+  int max_trials;                                  // max attempts to find non-overlapping position
+  double overlap_cut;                              // cutoff distance for overlap checking
+  double overlap_sq;                               // squared overlap distance
 
   // Filament nucleation modes
-  int nuc_mode;           // 0=none, 1=free nucleation, 2=branched
-  int nucleator_type;     // atom type that can nucleate branches (for mode 2)
+  int nuc_mode;                                    // 0=none, 1=free nucleation, 2=branched
+  int nucleator_type;                              // atom type that can nucleate branches (for mode 2)
 
   // Per-atom properties
-  int birth_time_index;            // birth time property index -- to access birth times as `double *birth_time = atom->dvector[birth_time_index];`
-  bool has_creation_time;          // flag if creation_time property exists
-  int filpos_index;                // filamwent position property index -- to access filament positions as `int *filpos = atom->dvector[filpos_index];`
-
-  // Thermodynamic integration
-  int respa_level;
-  int nlevels_respa;
+  int birth_time_index;                            // birth time property index -- to access birth times as `double *birth_time = atom->dvector[birth_time_index];`
+  bool has_creation_time;                          // flag if creation_time property exists
+  int filpos_index;                                // filament position property index -- to access filament positions as `int *filpos = atom->dvector[filpos_index];`
 
   // Trackers for particle and molecule IDs
   tagint MAX_TAG;
   tagint MAX_MOL;
-
-  // Bool flags for event completion
-  int did_nucleate;
 
   // Helper methods
   void grow_filament(tagint, int, int);                           // add particle at head of filament i
@@ -114,10 +100,11 @@ class FixTreadmilling : public Fix {
   void nucleate_branch(int);                                      // nucleate branch from atom i
   
   bool check_overlap(double *);                                   // check if position overlaps with others (globally)
+  bool should_happen(double);                                     // check if a rate-controlled event occurs based on the rate and timestep
   
   void create_particle(double *, tagint, int, tagint, int);       // create particle locally and update atom map
   void delete_particle(int);                                      // delete particle and update filament
-  void create_bonds(int, int);                                    // create bonds between consecutive filament atoms
+  void create_bond(tagint, tagint, int);                          // create bond of given type (int) between given atoms (tags)
   int delete_bonds(int);                                          // delete bonds involving particle i, return index for bound particle (index for subtail which become new tail)
   
   double compute_shrinkage_rate(double);                          // compute r_off(lifetime) = r_0(1-exp(-r_hyd*lifetime))

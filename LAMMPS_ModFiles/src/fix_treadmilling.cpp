@@ -118,8 +118,7 @@ struct filbounds {
 
 FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
   Fix(lmp, narg, arg), 
-  bondcount(nullptr), created(nullptr), copy(nullptr), random(nullptr), list(nullptr)
-  // random(nullptr), nlocalkeep(nullptr), nghostlykeep(nullptr)
+  bondcount(nullptr), copy(nullptr), random(nullptr), list(nullptr)
 {
   std::string fixname = fmt::format("fix {}", style);
   if (narg < 6) utils::missing_cmd_args(FLERR, fixname, error);
@@ -153,17 +152,10 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
   btype = 1;                            // bond type to create -- default: type 1
   atype = 1;                            // angle type to create -- default: type 1
   
-//   creation_time_flag = -1;
-//   filament_id_flag = -1;
-//   filament_pos_flag = -1;
-  
   seed = 12345;
-  nlevels_respa = 0;                    // from fix_bond_create.cpp / .h -- NOT SURE WE NEED
+  nlevels_respa = 0;                    // from fix_bond_create.cpp / .h
 
-  // Initialize per-atom property pointers
-//   creation_time_data = nullptr;
-//   filament_id_data = nullptr;
-//   filament_pos_data = nullptr;
+  // Special per-atom property handlers
   birth_time_index = -1;
   has_creation_time = false;
 
@@ -271,11 +263,6 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
   comm_forward = MAX(2,2+atom->maxspecial);
   comm_reverse = 2;
 
-  // Initialize arrays for created bonds
-  ncreated_bonds = 0;
-  maxcreated_bonds = 0;
-  created_bonds = nullptr;
-
   // Allocate copy
   // copy = special list for one atom
   // size = ms^2 + ms is sufficient
@@ -290,6 +277,9 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
   natoms = 0;
   nbonds = 0;
   nangles = 0;
+  natomsloc = 0;
+  nbondsloc = 0;
+  nanglesloc = 0;
   natomstotal = 0;
   nbondstotal = 0;
   nanglestotal = 0;
@@ -300,7 +290,6 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
 FixTreadmilling::~FixTreadmilling()
 {
   delete random;
-  memory->destroy(created);
   delete [] copy;
 }
 
@@ -390,6 +379,9 @@ void FixTreadmilling::post_integrate()
   natoms = 0;
   nbonds = 0;
   nangles = 0;
+  natomsloc = 0;
+  nbondsloc = 0;
+  nanglesloc = 0;
 
   double dt = update->dt;
   int nlocal = atom->nlocal;
@@ -477,6 +469,11 @@ void FixTreadmilling::post_integrate()
       }
     }
   } // end of nucleation if
+
+  // Increment cumulative counters
+  natomstotal += natoms;
+  nbondstotal += nbonds;
+  nanglestotal += nangles;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -563,6 +560,9 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
           len = sqrt(dx*dx+dy*dy+dz*dz);
           dx /= len; dy /= len; dz /= len;
       }
+      dx *= sigma;
+      dy *= sigma;
+      dz *= sigma;
       // New position
       new_pos[0] = head_pos[0] + dx + noise_sigma * random->gaussian();
       new_pos[1] = head_pos[1] + dy + noise_sigma * random->gaussian();
@@ -617,9 +617,10 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
   }
   // Increment local count of created particles
   natomsloc++;
-  // Broadcast particle count
+  // MPI reduce created particle count, check correct number created and reset local count for next event
   MPI_Allreduce(&natomsloc, &natoms, 1, MPI_INT, MPI_SUM, world);
-  if (natoms > 1) {error->warning(FLERR, "Created more than one particle in fix treadmilling grow_filament! Revise implementation!!");}
+  if (natoms > 1 && comm->me == 0) {error->warning(FLERR, "Created more than one particle in fix treadmilling grow_filament! Revise implementation!!");}
+  natomsloc = 0;
 
   // Forward communicate new particle position for bond creation
   comm->forward_comm(this);
@@ -660,7 +661,14 @@ void FixTreadmilling::shrink_filament(int tail_idx)
   if (dimer) {delete_particle(stidx);}
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   nucleate filament by creating two new particles at head and updating bonds and angles accordingly
+     - sample new random tail position, random orientation and corresponding head position
+      - uniform sampling of the box
+     - check overlaps and try again if necessary up to max_trials
+     - if successful, create new particles at those positions and create bond between them
+    needs to be called by all processors - handles rank locality and communications internally
+------------------------------------------------------------------------- */
 
 void FixTreadmilling::nucleate_filament()
 {
@@ -705,10 +713,15 @@ void FixTreadmilling::nucleate_filament()
 
     // Increment trials count
     trials++;
-    }
+  }
 
   // Return early if not placed
-  if (placed!=1) {return;}
+  if (placed!=1) {
+    if (comm->me == 0) {
+      error->warning(FLERR, "Fix treadmilling: failed particle placement in filament nucleation. ");
+    }
+    return;
+  }
 
   // Broadcast molecule id counters
   if (comm->me == 0) new_mol_id = MAX_MOL+1;
@@ -733,15 +746,28 @@ void FixTreadmilling::nucleate_filament()
     // If rank owns position of tail it creates tail
     int tail_fp = 4;                                                    // tail has filpos = 4 in dimer
     create_particle(pos1, new_tag_1, create_type, new_mol_id, tail_fp);
+    natomsloc++;                                                        // increment local count of created particles
   }
   if (domain->is_local(pos2)) {
     // If rank owns position of head it creates head
     int head_fp = 1;                                                    // head has filpos = 1 always, including in dimer
     create_particle(pos2, new_tag_2, create_type, new_mol_id, head_fp);
+    natomsloc++;                                                        // increment local count of created particles
   }
 
-  // Create dimer bonds
-  // TO-DO
+  // MPI reduce created particle count, check correct number created and reset local count for next event
+  MPI_Allreduce(&natomsloc, &natoms, 1, MPI_INT, MPI_SUM, world);
+  if (natoms != 2 && comm->me == 0) {error->warning(FLERR, "Did not create exactly two particles in fix treadmilling nucleate_filament! Revise implementation!!");}
+  natomsloc = 0;
+
+  // Forward communicate new particle position for bond creation
+  comm->forward_comm(this);
+
+  // Rebuild neighbor list for bond creation
+  neighbor->build_one(list);
+
+  // Create dimer bond (handles creation of angles too, although there are no angles in a dimer)
+  create_bond(new_tag_1, new_tag_2, btype);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -791,26 +817,12 @@ void FixTreadmilling::nucleate_branch(int nucleator_idx)
   }
 }
 
-/* ---------------------------------------------------------------------- */
-
-bool FixTreadmilling::in_this_proc(double *pos)
-{
-  double *sublo,*subhi;
-  if (domain->triclinic == 0) {
-    sublo = domain->sublo;
-    subhi = domain->subhi;
-  } else {
-    sublo = domain->sublo_lamda;
-    subhi = domain->subhi_lamda;
-  }
-
-  if (pos[0] >= sublo[0] && pos[0] < subhi[0] &&
-      pos[1] >= sublo[1] && pos[1] < subhi[1] &&
-      pos[2] >= sublo[2] && pos[2] < subhi[2]) {return true};
-  else {return false;}
-}
-
-/* ---------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------- 
+  check if a proposed position overlaps with any existing particle based on overlap_cut distance
+    each processor checks against its local and ghost particles and returns a flag
+    local flags are reduced with MPI_MAX to determine if any processor detected an overlap
+    returns true if overlap detected, false if safe to place -- global result returned to all processors
+------------------------------------------------------------------------- */
 
 bool FixTreadmilling::check_overlap(double *pos)
 {
@@ -1035,10 +1047,11 @@ void FixTreadmilling::create_bond(tagint tagi, tagint tagj, int btype)
   // this will handle any necessary updates to angles as well as special neighbor lists beyond 1-2
   update_topology(tag1, tag2); 
   
-  // Safely update global bond count via MPI reduction
+  // Safely update global bond count via MPI reduction, then reset local count for next event
   MPI_Allreduce(&nbondsloc, &nbonds, 1, MPI_INT, MPI_SUM, world);
   if (nbonds > 1) {error->warning(FLERR, "Created more than one bond in fix treadmilling create_bond! Revise implementation!!");}
   atom->nbonds += nbonds;
+  nbondsloc = 0;
 
   // Trigger reneigbouring if any bonds were formed
   if (nbonds > 0) next_reneighbor = update->ntimestep;
@@ -1084,7 +1097,12 @@ int FixTreadmilling::delete_bonds(int idx)
   return stidx;
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+  compute the lifetime-dependent shrinking rate of a filament
+    r_off = r_off_base * (1 - exp(-rhyd * lifetime))
+      where lifetime is the lifetime of the tail monomer: (current step - birth step) * dt
+    returns 0 if invalid rhyd (<=0)
+------------------------------------------------------------------------- */
 
 double FixTreadmilling::compute_shrinkage_rate(double lifetime)
 {
@@ -1134,11 +1152,15 @@ void FixTreadmilling::check_ghosts()
    if influenced, then:
      rebuild the atom's special list of 1-2,1-3,1-4 neighs
      check for angles to create due modified special list
+   this is done on all processors for all atoms, but only the influenced atoms will have their topology updated
+   nangles is updated locally and then reduced globally at the end to update global angle count
+     if newton_bond=0, each angle is stored on 3 atoms instead of 1, so divide by 3 at the end to avoid double counting
+   also check for overflow of special list and angle list and set overflow flag if necessary
 
   ADAPTED FROM fix_bond_create.cpp
 ------------------------------------------------------------------------- */
 
-void FixTreadmilling::update_topology(tagint id1, tagint id2)
+void FixTreadmilling::update_topology(tagint id1, tagint id2)         // by convention in create_bond, id1 < id2 -- so id1 is central atom for angle creation and id2 is the new neighbor being added
 {
   int i,j,k,n,influence,influenced;                                   // influence = does this atom "touch" a newly created bond?; influenced = does this atom touch any newly created bond?
   tagint id1,id2;
@@ -1172,7 +1194,7 @@ void FixTreadmilling::update_topology(tagint id1, tagint id2)
 
     if (influenced) {
       rebuild_special_one(i);                                         // update 1-2/1-3/1-4 neighbor list
-      create_angles(i);                                               // create new angles involving atom i
+      create_angle(i, id1, id2);                                      // create new angles involving atom i, knowing that id1 is the central atom and id2 is the new neighbor being added
     }
   }
 
@@ -1182,11 +1204,11 @@ void FixTreadmilling::update_topology(tagint id1, tagint id2)
     error->all(FLERR, Error::NOLASTLINE,
                "Fix {} induced too many angles per atom", style);
 
-  int newton_bond = force->newton_bond;
-  int all_angles;
-  MPI_Allreduce(&nangles,&all_angles,1,MPI_INT,MPI_SUM,world);
-  if (!newton_bond) all /= 3;
-  atom->nangles += all;
+  // Safely update global angle count via MPI reduction and reset local count for next event
+  MPI_Allreduce(&nanglesloc,&nangles,1,MPI_INT,MPI_SUM,world);
+  if (!force->newton_bond) nangles /= 3;
+  atom->nangles += nangles;
+  nanglesloc = 0;
 }
 
 /* ----------------------------------------------------------------------
@@ -1289,15 +1311,21 @@ int FixTreadmilling::dedup(int nstart, int nstop, tagint *copy)
 /* ----------------------------------------------------------------------
    create any angles owned by atom M induced by newly created bonds
    walk special list to find all possible angles to create
-   only add an angle if a new bond is one of its 2 bonds (I-J,J-K)
+   only add an angle if a new bond is one of its 2 bonds (I-J,J-K) -- IDENTIFIED BY ID1 and ID3
+   only add an angle if atom IDs match given IDs (id1 and id3)
    for newton_bond on, atom M is central atom
    for newton_bond off, atom M is any of 3 atoms in angle
 
   ADAPTED FROM fix_bond_create.cpp
 ------------------------------------------------------------------------- */
 
-void FixTreadmilling::create_angles(int m)
+void FixTreadmilling::create_angle(int m, tagint id1, tagint id2)
 {
+  // id1 and id2 are two bond atom tags -- id1 is central angle atom and id2 is new neighbor being added 
+  //   so only create angles where id1 is central atom and id2 is one of the outer atoms, 
+  //   which ensures we only create angles that are actually new due to the new bond creation, 
+  //   and we don't double count angles when looping over both bond endpoints in update_topology
+
   int i,j,n,i2local,n1,n2;
   tagint i1,i2,i3;
   tagint *s1list,*s2list;
@@ -1312,11 +1340,11 @@ void FixTreadmilling::create_angles(int m)
   tagint *angle_atom2 = atom->angle_atom2[m];
   tagint *angle_atom3 = atom->angle_atom3[m];
 
-  // atom M is central atom in angle
+  // atom M is central atom in angle -- means its tag should match id1, and one of its 1-2 neighbors should match id2
   // double loop over 1-2 neighs
   // avoid double counting by 2nd loop as j = i+1,N not j = 1,N
   // consider all angles, only add if:
-  //   a new bond is in the angle and atom types match
+  //   IDs match given IDs (id1 and id3)
 
   i2 = tag[m];
   n2 = nspecial[m][0];
@@ -1328,16 +1356,10 @@ void FixTreadmilling::create_angles(int m)
       i3 = s2list[j];
 
       // angle = i1-i2-i3
+      // check i2 = id1 and i3 = id2
+      if (i2 != id1 || i3 != id2) continue;
 
-      for (n = 0; n < ncreate; n++) {
-        if (created[n][0] == i1 && created[n][1] == i2) break;
-        if (created[n][0] == i2 && created[n][1] == i1) break;
-        if (created[n][0] == i2 && created[n][1] == i3) break;
-        if (created[n][0] == i3 && created[n][1] == i2) break;
-      }
-      if (n == ncreate) continue;
-
-      // NOTE: this is place to check atom types of i1,i2,i3
+      // NOTE: this is place to check atom types of i1,i2,i3 - but we don't care about atom types so we don't check
 
       if (num_angle < atom->angle_per_atom) {
         angle_type[num_angle] = atype;
@@ -1345,7 +1367,7 @@ void FixTreadmilling::create_angles(int m)
         angle_atom2[num_angle] = i2;
         angle_atom3[num_angle] = i3;
         num_angle++;
-        nangles++;
+        nanglesloc++;                               // increment local angles count (function is called locally)
       } else overflow = 1;
     }
   }
@@ -1354,6 +1376,7 @@ void FixTreadmilling::create_angles(int m)
   if (force->newton_bond) return;
 
   // for newton_bond off, also consider atom M as atom 1 in angle
+  // then its two 1-2 neighbors are atoms 2 and 3 in angle, and we check if either of them is id1 and the other is id2
 
   i1 = tag[m];
   n1 = nspecial[m][0];
@@ -1372,16 +1395,10 @@ void FixTreadmilling::create_angles(int m)
       if (i3 == i1) continue;
 
       // angle = i1-i2-i3
+      // check i2 = id1 and i3 = id2
+      if (i2 != id1 || i3 != id2) continue;
 
-      for (n = 0; n < ncreate; n++) {
-        if (created[n][0] == i1 && created[n][1] == i2) break;
-        if (created[n][0] == i2 && created[n][1] == i1) break;
-        if (created[n][0] == i2 && created[n][1] == i3) break;
-        if (created[n][0] == i3 && created[n][1] == i2) break;
-      }
-      if (n == ncreate) continue;
-
-      // NOTE: this is place to check atom types of i1,i2,i3
+      // NOTE: this is place to check atom types of i1,i2,i3 - but we don't care about atom types so we don't check
 
       if (num_angle < atom->angle_per_atom) {
         angle_type[num_angle] = atype;
@@ -1389,7 +1406,7 @@ void FixTreadmilling::create_angles(int m)
         angle_atom2[num_angle] = i2;
         angle_atom3[num_angle] = i3;
         num_angle++;
-        nangles++;
+        nanglesloc++;                               // increment local angles count (function is called locally)
       } else overflow = 1;
     }
   }
