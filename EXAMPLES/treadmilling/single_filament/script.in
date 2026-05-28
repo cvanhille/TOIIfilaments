@@ -2,7 +2,7 @@ log                 log.out
 units               lj
 dimension           2
 atom_style          molecular
-read_data           config.in
+read_data           config.in   extra/bond/per/atom 5  extra/special/per/atom 20  extra/angle/per/atom 3
 
 # Required per-atom custom properties for fix_treadmilling
 # - d_birth_time : double storing the creation timestep of a monomer
@@ -22,7 +22,7 @@ variable            eps equal 5.00                                # LJ attractio
 variable            Kbond equal 1000.0                            # bond constant [kT/sigma2]
 variable            Kbend equal 800.0                             # bend constant [kT/sigma2]
 variable            tstep equal 0.001000                          # simulation timestep size [seconds]
-variable            run_time equal 600.0                          # simulation run time [seconds]
+variable            run_time equal 600.0                          # simulation run time [seconds] 45.0 #
 variable            frame_rate equal 1.0                          # dumping interval [seconds]
 variable            seed equal 1234                               # random number generator seed
 
@@ -31,7 +31,7 @@ variable            run_steps equal ${run_time}/${tstep}          # simulation r
 variable            dump_time equal ${frame_rate}/${tstep}        # dumping interval [simulation steps]
 
 # Treadmilling kinetic parameters (example values)
-variable r_on    equal 0.01
+variable r_on    equal 1000.00
 variable r_off   equal 0.00
 variable r_hyd   equal 0.1
 variable r_nuc   equal 0.0
@@ -55,10 +55,7 @@ pair_style          lj/cut 2.50
 pair_coeff          1 1 ${eps} 1.00 ${rmin}
 
 # Treadmilling dynamics (nevery = ${rstep} timesteps)
-fix  tread all treadmilling ${rstep} \
-	r_on ${r_on} r_off ${r_off} r_hyd ${r_hyd} r_nuc ${r_nuc} nuc_mode 1 \
-	sigma ${sigma_tm} noise ${noise_tm} maxtrials ${maxtrials} overlap ${overlap_tm} \
-	temp 1.0 ptype ${ptype_tm} btype ${btype_tm} atype ${atype_tm} seed ${seed_tm}
+fix                 fTread all treadmilling ${rstep} r_on ${r_on} r_off ${r_off} r_hyd ${r_hyd} r_nuc ${r_nuc} nuc_mode 1 sigma ${sigma_tm} noise ${noise_tm} maxtrials ${maxtrials} overlap ${overlap_tm} temp 1.0 ptype ${ptype_tm} btype ${btype_tm} atype ${atype_tm} seed ${seed_tm}
 fix                 fLang all langevin 1.0 1.0 1.0 ${seed}
 fix                 fNVE all nve
 

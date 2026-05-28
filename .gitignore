@@ -2,5 +2,6 @@
 */.DS_Store
 **/.DS_Store
 
+**/log.lammps
 **/*.out
 **/*.xyz

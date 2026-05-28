@@ -162,7 +162,7 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
   has_creation_time = false;
 
   // Parse arguments
-  int iarg = 3;
+  int iarg = 4;
   while (iarg < narg) {
     if (strcmp(arg[iarg],"r_on") == 0) {
       if (iarg+2 > narg) error->all(FLERR,"Illegal fix treadmilling r_on");
@@ -242,9 +242,9 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
   fprintf(lmp->screen, "  noise_sigma = %.2f\n", noise_sigma);
   fprintf(lmp->screen, "  max_trials  = %d\n", max_trials);
   fprintf(lmp->screen, "  overlap_cut = %.2f\n", overlap_cut);
-  fprintf(lmp->screen, "  ptype        = %d\n", ptype);
-  fprintf(lmp->screen, "  btype        = %d\n", btype);
-  fprintf(lmp->screen, "  atype        = %d\n", atype);
+  fprintf(lmp->screen, "  ptype       = %d\n", ptype);
+  fprintf(lmp->screen, "  btype       = %d\n", btype);
+  fprintf(lmp->screen, "  atype       = %d\n", atype);
   fprintf(lmp->screen, "  seed        = %d\n", seed);
   fprintf(lmp->screen, "  temp        = %.2f\n", temp);
   fprintf(lmp->screen, "\n\n");
@@ -334,7 +334,7 @@ void FixTreadmilling::init()
   //  fix prop2 all property/atom i_filpos
   int flagFP, colsFP;
   filpos_index = atom->find_custom("filpos", flagFP, colsFP);
-  if (filpos_index < 0 || flagFP != 1) {error->all(FLERR, "Fix treadmilling: i_filpos property not found. ");}
+  if (filpos_index < 0 || flagFP != 0) {error->all(FLERR, "Fix treadmilling: i_filpos property not found. ");}
 
   // Check for pair style
   if (force->pair == nullptr)
@@ -445,8 +445,10 @@ void FixTreadmilling::post_integrate()
     
     // Growth event
     if (r_on > 0) {
+      fprintf(lmp->screen, "Evaluating growth for filament %d (head tag %d (idx %d), tail tag %d (idx %d), subhead tag %d (idx %d)) at timestep %ld -- p = %g\n", mol_id, tag[hid], hid, tag[tid], tid, tag[shid], shid, update->ntimestep, r_on * dt);
       if (should_happen(r_on)) {
         // Grow filament - takes care of everything: sampling new position, checking overlaps, creating particle, bonds and angles, and updating head and subhead flags
+        fprintf(lmp->screen, "  Attempting growth for filament %d (head tag %d (idx %d), tail tag %d (idx %d), subhead tag %d (idx %d)) at timestep %ld\n", mol_id, tag[hid], hid, tag[tid], tid, tag[shid], shid, update->ntimestep);
         grow_filament(mol_id, hid, shid);
       }
     }
@@ -550,32 +552,55 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
   // Sample new position
   int trials = 0;
   bool placed = false;
+  fprintf(lmp->screen, "  Sampling new position for growth of filament %d at timestep %ld -- head pos (%.3f, %.3f, %.3f), subhead pos (%.3f, %.3f, %.3f)\n", mol_id, update->ntimestep, head_pos[0], head_pos[1], head_pos[2], shead_pos[0], shead_pos[1], shead_pos[2]);
+  // Displacement
+  double dx = head_pos[0] - shead_pos[0];
+  double dy = head_pos[1] - shead_pos[1];
+  double dz = head_pos[2] - shead_pos[2];
+  if (domain->dimension == 2) dz = 0.0;
+  // Displacement PBCs
+  domain->minimum_image(FLERR, dx, dy, dz);
+  // if (dx > 0.5*(domain->boxhi[0]-domain->boxlo[0])) dx -= domain->boxhi[0]-domain->boxlo[0];
+  // if (dx < -0.5*(domain->boxhi[0]-domain->boxlo[0])) dx += domain->boxhi[0]-domain->boxlo[0];
+  // if (dy > 0.5*(domain->boxhi[1]-domain->boxlo[1])) dy -= domain->boxhi[1]-domain->boxlo[1];
+  // if (dy < -0.5*(domain->boxhi[1]-domain->boxlo[1])) dy += domain->boxhi[1]-domain->boxlo[1];
+  // if (dz > 0.5*(domain->boxhi[2]-domain->boxlo[2])) dz -= domain->boxhi[2]-domain->boxlo[2];
+  // if (dz < -0.5*(domain->boxhi[2]-domain->boxlo[2])) dz += domain->boxhi[2]-domain->boxlo[2];
+  // Normalize and scale by sigma
+  double len = sqrt(dx*dx+dy*dy+dz*dz);
+  if (len > 1e-10) {dx /= len; dy /= len; dz /= len;}
+  else {
+      // fallback: random unit vector if head and shead coincide
+      dx = random->gaussian();
+      dy = random->gaussian();
+      dz = random->gaussian();
+      if (domain->dimension == 2) dz = 0.0;
+      len = sqrt(dx*dx+dy*dy+dz*dz);
+      dx /= len; dy /= len; dz /= len;
+  }
+  dx *= sigma;
+  dy *= sigma;
+  dz *= sigma;
+  fprintf(lmp->screen, "  Displacement for new head position for growth of filament %d at timestep %ld: (%.3f, %.3f, %.3f)\n", mol_id, update->ntimestep, dx, dy, dz);
+  fprintf(lmp->screen, "  No noise position: (%.3f, %.3f, %.3f)\n", head_pos[0]+dx, head_pos[1]+dy, head_pos[2]+dz);
   while (!placed && trials < max_trials) {
     // Only sample new position on main thread (rank 0)
     if (comm->me == 0) {
-      // Displacement
-      double dx = head_pos[0] - shead_pos[0];
-      double dy = head_pos[1] - shead_pos[1];
-      double dz = head_pos[2] - shead_pos[2];
-      double len = sqrt(dx*dx+dy*dy+dz*dz);
-      if (len > 1e-10) {dx /= len; dy /= len; dz /= len;}
-      else {
-          // fallback: random unit vector if head and shead coincide
-          dx = random->gaussian();
-          dy = random->gaussian();
-          dz = random->gaussian();
-          len = sqrt(dx*dx+dy*dy+dz*dz);
-          dx /= len; dy /= len; dz /= len;
-      }
-      dx *= sigma;
-      dy *= sigma;
-      dz *= sigma;
       // New position
       new_pos[0] = head_pos[0] + dx + noise_sigma * random->gaussian();
       new_pos[1] = head_pos[1] + dy + noise_sigma * random->gaussian();
-      new_pos[2] = head_pos[2] + dz + noise_sigma * random->gaussian();
+      if (domain->dimension == 2) new_pos[2] = head_pos[2];
+      else {
+        new_pos[2] = head_pos[2] + dz + noise_sigma * random->gaussian();
+      }
       // Check PBCs
       domain->remap(new_pos);
+      // if (new_pos[0] < domain->boxlo[0]) new_pos[0] += domain->boxhi[0] - domain->boxlo[0];
+      // if (new_pos[0] >= domain->boxhi[0]) new_pos[0] -= domain->boxhi[0] - domain->boxlo[0];
+      // if (new_pos[1] < domain->boxlo[1]) new_pos[1] += domain->boxhi[1] - domain->boxlo[1];
+      // if (new_pos[1] >= domain->boxhi[1]) new_pos[1] -= domain->boxhi[1] - domain->boxlo[1];
+      // if (new_pos[2] < domain->boxlo[2]) new_pos[2] += domain->boxhi[2] - domain->boxlo[2];
+      // if (new_pos[2] >= domain->boxhi[2]) new_pos[2] -= domain->boxhi[2] - domain->boxlo[2];
     }
     // Broadcast new position to all threads
     MPI_Bcast(new_pos, 3, MPI_DOUBLE, 0, world);
@@ -583,6 +608,7 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
     if (!check_overlap(new_pos)) {placed=true;}
     trials++;
   }
+  fprintf(lmp->screen, "  Sampled new position (%.3f, %.3f, %.3f) for growth of filament %d at timestep %ld after %d trials\n", new_pos[0], new_pos[1], new_pos[2], mol_id, update->ntimestep, trials);
   
   if (!placed && comm->me == 0) {      // return early if failed placement
     error->warning(FLERR, "Fix treadmilling: failed particle placement in filament growth. ");
@@ -621,12 +647,15 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
   //// Locally create particle, if rank owns position of new particle
   if (is_local(new_pos)) {
     create_particle(new_pos, new_tag, ptype, mol_id, 1);
+    // Increment local count of created particles
+    natomsloc++;
   }
-  // Increment local count of created particles
-  natomsloc++;
   // MPI reduce created particle count, check correct number created and reset local count for next event
   MPI_Allreduce(&natomsloc, &natoms, 1, MPI_INT, MPI_SUM, world);
+  fprintf(lmp->screen, "  Created %d new particles for growth of filament %d at timestep %ld\n", natoms, mol_id, update->ntimestep);
   if (natoms > 1 && comm->me == 0) {error->warning(FLERR, "Created more than one particle in fix treadmilling grow_filament! Revise implementation!!");}
+  atom->natoms += natoms;         // update global atom count in atom class -- necessary for correct neighbor list rebuild and communication handling
+  fprintf(lmp->screen, "  Updated global atom count to %d after growth of filament %d at timestep %ld\n", atom->natoms, mol_id, update->ntimestep);
   natomsloc = 0;
 
   // Forward communicate new particle position for bond creation

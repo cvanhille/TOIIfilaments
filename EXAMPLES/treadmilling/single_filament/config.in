@@ -7,7 +7,7 @@ First line of this config file
 1 angle types
 -100.0 100.0 xlo xhi
 -100.0 100.0 ylo yhi
--0.25 0.25 zlo zhi
+-25.0 25.0 zlo zhi
 
 Masses
 
