@@ -71,7 +71,7 @@ STRUCTURE:
     - record decisions: e.g.:
       - grow_list.push_back(filament_id, head_tag, subhead_tag)
       - shrink_list.push_back(filament_id, tail_tag)
-      - nucleate_list.push_back(…)
+      - nucleate_list.push_back(filament_id)
   - PRE_EXCHANGE step: Changes to atom topology
     - atom creation:
       - create_atom(x,y,z,type)
@@ -569,8 +569,8 @@ void FixTreadmilling::pre_exchange() {
         shrink_filament(s.filament_id, s.tail_tag);
 
     // perform nucleation operations
-    for (auto &n : nucleate_list)
-        nucleate_filament();
+    for (auto &m : nucleate_list)
+        nucleate_filament(m);
 
     // cleanup: clear lists
     grow_list.clear();

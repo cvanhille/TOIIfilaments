@@ -96,6 +96,45 @@ class FixTreadmilling : public Fix {
   // Temperature
   double temp;                                                             // system temperature, for velocity initialization during creation - assumed constant and uniform for now, but could be made more complex in the future by accessing compute_temp or similar
 
+  // ---- Growth operation entry ----
+  // When a filament grows, we need:
+  //   - filament_id (molecule id)
+  //   - head_tag
+  //   - subhead_tag
+  struct GrowOp {
+    tagint filament_id;
+    tagint head_tag;
+    tagint subhead_tag;
+    GrowOp(tagint f, tagint h, tagint s)
+       : filament_id(f), head_tag(h), subhead_tag(s) {}
+  };
+
+  // ---- Shrink operation entry ----
+  // When a filament shrinks, we need:
+  //   - filament_id (molecule id)
+  //   - tail_tag
+  struct ShrinkOp {
+    tagint filament_id;
+    tagint tail_tag;
+
+    ShrinkOp(tagint f, tagint t)
+     : filament_id(f), tail_tag(t) {}
+  };
+
+  // ---- Nucleation operation entry ----
+  // When a filament nucleates, we need:
+  //   - new filament_id (molecule id)
+  struct NucleateOp {
+    tagint filament_id;
+
+    NucleateOp(tagint f)
+      : filament_id(f) {}
+  };
+
+  std::vector<GrowOp>      grow_list;
+  std::vector<ShrinkOp>    shrink_list;
+  std::vector<NucleateOp>  nucleate_list;
+
   // Helper methods
   void grow_filament(tagint, int, int);                                    // add particle at head of filament i
   void shrink_filament(int);                                               // remove particle from tail of filament i
