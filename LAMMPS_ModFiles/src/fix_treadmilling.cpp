@@ -345,6 +345,10 @@ void FixTreadmilling::init()
     has_creation_time = true;
   }
 
+  if (!has_creation_time) 
+    error->all(FLERR, Error::NOLASTLINE,
+               "Fix {} could not find any creation/birth time property. Aborting... Please revise!", style);
+
   // Set comm sizes needed by this fix
   // special list: 1 (count) + maxspecial (entries)
   // filpos: 1
@@ -394,9 +398,7 @@ void FixTreadmilling::post_integrate()
 {
   if (update->ntimestep % nevery) return;
 
-  if (!has_creation_time) 
-    error->all(FLERR, Error::NOLASTLINE,
-               "Fix {} could not find any creation/birth time property. Aborting... Please revise!", style);
+  // NEW STRUCTURE: only keep reaction action bookkeeping: read positions, evaluate rates and pick events that should happen - store in NEW STRUCTURES (grow_list, shrink_list, nucleate_list)
 
   // Ensure neighbor list is current for ghost atoms
   if (lastcheck <= neighbor->lastcall) check_ghosts();
@@ -549,6 +551,31 @@ void FixTreadmilling::post_integrate()
 void FixTreadmilling::post_integrate_respa(int ilevel, int /*iloop*/)
 {
   if (ilevel == nlevels_respa-1) post_integrate();
+}
+
+/* ---------------------------------------------------------------------- */
+void FixTreadmilling::pre_exchange() {
+
+  // NEW STRUCTURE: tentative PRE_EXCHANGE skeleton function:
+  // perform topology-changing work:
+  // all creation/deletion operations - atoms, bonds, angles...
+
+    // perform growth operations
+    for (auto &g : grow_list)
+        grow_filament(g.filament_id, g.head_tag, g.subhead_tag);
+
+    // perform shrink operations
+    for (auto &s : shrink_list)
+        shrink_filament(s.filament_id, s.tail_tag);
+
+    // perform nucleation operations
+    for (auto &n : nucleate_list)
+        nucleate_filament();
+
+    // cleanup: clear lists
+    grow_list.clear();
+    shrink_list.clear();
+    nucleate_list.clear();
 }
 
 /* ----------------------------------------------------------------------
