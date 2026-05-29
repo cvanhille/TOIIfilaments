@@ -45,7 +45,7 @@ variable atype_tm equal 1
 variable seed_tm equal 12345
 
 #special_bonds       lj 1.0 1.0 1.0
-special_bonds       lj 0.0 0.0 1.0
+special_bonds       lj 0.0 0.0 0.0
 
 bond_style          harmonic
 bond_coeff          1 ${Kbond} 1.0
@@ -60,9 +60,6 @@ pair_coeff          1 1 ${eps} 1.00 ${rmin}
 fix                 fTread all treadmilling ${rstep} r_on ${r_on} r_off ${r_off} r_hyd ${r_hyd} r_nuc ${r_nuc} nuc_mode 1 sigma ${sigma_tm} noise ${noise_tm} maxtrials ${maxtrials} overlap ${overlap_tm} temp 1.0 ptype ${ptype_tm} btype ${btype_tm} atype ${atype_tm} seed ${seed_tm}
 fix                 fLang all langevin 1.0 1.0 1.0 ${seed}
 fix                 fNVE all nve
-
-#communicate single cutoff 3.0   # must exceed bond_length + skin
-#neighbor 2.0 bin
 
 variable            realtime equal step*${tstep}
 

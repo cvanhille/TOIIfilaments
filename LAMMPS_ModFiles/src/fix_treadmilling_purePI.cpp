@@ -61,34 +61,6 @@ See the README file in the top-level LAMMPS directory.
 Contributing Author: Christian Vanhille Campos (christian.vanhille@sorbonne-universite.fr)
 ------------------------------------------------------------------------- */
 
-/* ----------------------------------------------------------------------
-STRUCTURE:
-  - POST_INTEGRATE step: Bookkeeping & probability evaluation
-    - if (update->ntimestep % nevery) return;
-    - compute rates
-    - sample random events
-    - determine which filaments should grow or shrink
-    - record decisions: e.g.:
-      - grow_list.push_back(filament_id, head_tag, subhead_tag)
-      - shrink_list.push_back(filament_id, tail_tag)
-      - nucleate_list.push_back(…)
-  - PRE_EXCHANGE step: Changes to atom topology
-    - atom creation:
-      - create_atom(x,y,z,type)
-      - assign molecule ID
-      - set velocities, flags, creation time
-    - bond/angle creation:
-      - atom->add_bond(...)
-      - atom->add_angle(...)
-      - update per-bond special neighbors
-    - atom deletion:
-      - delete an end monomer
-      - remove bonds and angles referencing it
-      - compact lists
-    - Updating filament linked structure: filpos in particular (head, subhead & tail logic)
-
-------------------------------------------------------------------------- */
-
 #include "fix_treadmilling.h"
 
 #include "atom.h"
@@ -107,6 +79,16 @@ STRUCTURE:
 #include "random_mars.h"
 #include "respa.h"
 #include "update.h"
+
+// #include "citeme.h"
+// #include "compute.h"
+// #include "domain.h"
+// #include "fix_bond_history.h"
+// #include "group.h"
+// #include "input.h"
+// #include "math_extra.h"
+// #include "reset_atoms_mol.h"
+// #include "variable.h"
 
 #include <cctype>
 #include <cmath>
@@ -322,7 +304,6 @@ int FixTreadmilling::setmask()
   int mask = 0;
   mask |= POST_INTEGRATE;
   mask |= POST_INTEGRATE_RESPA;
-  mask |= PRE_EXCHANGE;
   return mask;
 }
 
