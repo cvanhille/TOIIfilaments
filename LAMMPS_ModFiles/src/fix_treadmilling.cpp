@@ -265,11 +265,6 @@ FixTreadmilling::FixTreadmilling(class LAMMPS *lmp, int narg, char **arg) :
   // Update squared cutoff distance
   overlap_sq = overlap_cut*overlap_cut;
 
-  // Set comm sizes needed by this fix
-  // forward is big due to comm of broken bonds and 1-2 neighbors
-  comm_forward = MAX(2,2+atom->maxspecial);
-  comm_reverse = 2;
-
   // Allocate copy
   // copy = special list for one atom
   // size = ms^2 + ms is sufficient
@@ -329,6 +324,13 @@ void FixTreadmilling::init()
     has_creation_time = true;
   }
 
+  // Set comm sizes needed by this fix
+  // special list: 1 (count) + maxspecial (entries)
+  // filpos: 1
+  // birth_time: 1 (if present)
+  comm_forward = 2 + atom->maxspecial + (has_creation_time ? 1 : 0);
+  comm_reverse = 0;   // no reverse communication needed yet
+
   // Check and validate per-atom property "filpos" exists - get its index
   // User must define it in input script before calling this fix:
   //  fix prop2 all property/atom i_filpos
@@ -378,9 +380,16 @@ void FixTreadmilling::post_integrate()
   // Ensure neighbor list is current for ghost atoms
   if (lastcheck <= neighbor->lastcall) check_ghosts();
 
+  fprintf(lmp->screen, "FIX TREADMILLING RUN: performing post_integrate operations at timestep %ld\n", update->ntimestep);
+
+  // Force remap of atom positions to avoid PBC issues after integration drift
+  domain->pbc();           // remap all atoms back into box
+
   // Acquire updated ghost atom positions
   // necessary b/c are calling this after integrate, but before Verlet comm
   comm->forward_comm();
+
+  fprintf(lmp->screen, "  Processor %d: Atom positions remapped. Neighbor list updated for ghost atoms. Now identifying filaments and performing reactions...\n", comm->me);
 
   // Zero global creation counts for this timestep
   natoms = 0;
@@ -401,6 +410,19 @@ void FixTreadmilling::post_integrate()
   double *birth_step = atom->dvector[birth_time_index];
   int *filpos = atom->ivector[filpos_index];
   double **x = atom->x;
+
+  // Let's look for the last created particle and get its local index
+  // Now scan over nlocal to find new tag and corresponding index
+  int new_idx = -1;
+  int own_proc = -1;
+  for (int i = 0; i < nlocal; i++) {
+    if (tag[i] == MAX_TAG) {
+      new_idx = i;
+      own_proc = comm->me;
+      break;
+    }
+  }
+  fprintf(lmp->screen, "  Last created particle has tag %d and local index %d on processor %d - filpos = %d, birth_step = %f\n", MAX_TAG, new_idx, own_proc, filpos[new_idx], birth_step[new_idx]);
   
   // Find current max particle and molecule ID
   tagint local_max_tag = 0;
@@ -424,6 +446,7 @@ void FixTreadmilling::post_integrate()
     // Insert with sentinel values if not yet seen
     auto it = filament_bounds.find(m);
     if (it == filament_bounds.end()) {
+      fprintf(lmp->screen, "      Filament with molecule ID %d found on processor %d for the first time. Adding to map with head_idx = tail_idx = subhead_idx = -1.\n", m, comm->me);
       it = filament_bounds.emplace(m, filbounds{-1, -1, -1}).first;
     }
     // Set index when special non-bulk particle found
@@ -432,8 +455,11 @@ void FixTreadmilling::post_integrate()
     //   - Subhead: 2 if pure subhead, 4 if subhead of dimer (also tail)
     //   - Tail: 3 if pure tail, 4 if tail of dimer (also subhead)
     if (k == 1) it->second.head_idx  = i;                   // head index
+    if (k == 1) fprintf(lmp->screen, "        Found head particle with tag %d (idx %d) for filament with molecule ID %d on processor %d\n", tag[i], i, m, comm->me);
     if (k == 2 || k == 4) it->second.subhead_idx = i;       // subhead index
+    if (k == 2 || k == 4) fprintf(lmp->screen, "        Found subhead particle with tag %d (idx %d) for filament with molecule ID %d on processor %d\n", tag[i], i, m, comm->me);
     if (k == 3 || k == 4) it->second.tail_idx = i;          // tail index
+    if (k == 3 || k == 4) fprintf(lmp->screen, "        Found tail particle with tag %d (idx %d) for filament with molecule ID %d on processor %d\n", tag[i], i, m, comm->me);
   }
 
   // For each filament (molecule ID), attempt growth and shrinkage events 
@@ -442,6 +468,8 @@ void FixTreadmilling::post_integrate()
     auto hid = bounds.head_idx;
     auto tid = bounds.tail_idx;
     auto shid = bounds.subhead_idx;
+
+    fprintf(lmp->screen, "Evaluating filament with molecule ID %d on processor %d with head idx %d (tag %d), tail idx %d (tag %d) and subhead idx %d (tag %d)\n", mol_id, comm->me, hid, tag[hid], tid, tag[tid], shid, tag[shid]);
     
     // Growth event
     if (r_on > 0) {
@@ -518,10 +546,15 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
 
   // Head tag
   tagint head_tag = tag[hidx];
+  if (head_tag == (tagint) 140) {
+    fprintf(lmp->screen, "      Head %d - hidx = %d, shid = %d\n", (int)head_tag, hidx, shidx);
+  }
 
   // Sample new position near head
-  double head_pos[3], shead_pos[3], new_pos[3];
+  double head_pos[3], shead_pos[3], new_pos[3], wrapped[3];
   int hproc, shproc;
+  imageint image = ((imageint) IMGMAX << IMG2BITS) |
+                     ((imageint) IMGMAX << IMGBITS) | IMGMAX;
 
   // If current head owned by this processor define head position
   int hproc_loc = -1;
@@ -529,6 +562,7 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
     if (is_local(x[hidx])) {
       head_pos[0] = x[hidx][0]; head_pos[1] = x[hidx][1]; head_pos[2] = x[hidx][2];
       hproc_loc = comm->me;
+      fprintf(lmp->screen, "    Filament %d head found on processor %d at index %d with position (%.3f, %.3f, %.3f)\n", mol_id, comm->me, hidx, head_pos[0], head_pos[1], head_pos[2]);
     }
   }
   // Broadcast to all other processors
@@ -542,6 +576,7 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
     if (is_local(x[shidx])) {
       shead_pos[0] = x[shidx][0]; shead_pos[1] = x[shidx][1]; shead_pos[2] = x[shidx][2];
       shproc_loc = comm->me;
+      fprintf(lmp->screen, "    Filament %d subhead found on processor %d at index %d with position (%.3f, %.3f, %.3f)\n", mol_id, comm->me, shidx, shead_pos[0], shead_pos[1], shead_pos[2]);
     }
   }
   // Broadcast to all other processors
@@ -593,8 +628,9 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
       else {
         new_pos[2] = head_pos[2] + dz + noise_sigma * random->gaussian();
       }
+      // CHANGING TO NO MANUAL WRAPPING HERE!
       // Check PBCs
-      domain->remap(new_pos);
+      // domain->remap(new_pos);
       // if (new_pos[0] < domain->boxlo[0]) new_pos[0] += domain->boxhi[0] - domain->boxlo[0];
       // if (new_pos[0] >= domain->boxhi[0]) new_pos[0] -= domain->boxhi[0] - domain->boxlo[0];
       // if (new_pos[1] < domain->boxlo[1]) new_pos[1] += domain->boxhi[1] - domain->boxlo[1];
@@ -604,11 +640,18 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
     }
     // Broadcast new position to all threads
     MPI_Bcast(new_pos, 3, MPI_DOUBLE, 0, world);
-    // Check overlaps
-    if (!check_overlap(new_pos)) {placed=true;}
+    // WRAP NEW POSITION AND UPDATE PBC IMAGES BEFORE CHECKING OVERLAPS
+    // Compute image flags and wrapped position before creating atom
+    wrapped[0] = new_pos[0]; wrapped[1] = new_pos[1]; wrapped[2] = new_pos[2];
+    domain->remap(wrapped, image);  // wrapped gets the in-box coords, image gets the offset
+    // // Check overlaps
+    // if (!check_overlap(new_pos)) {placed=true;}
+    // Check overlaps WITH WRAPPED POSITION (i.e. where atom will actually be created after PBC handling) -- this is important to avoid creating overlapping atoms across PBC boundaries
+    if (!check_overlap(wrapped)) {placed=true;}
     trials++;
   }
   fprintf(lmp->screen, "  Sampled new position (%.3f, %.3f, %.3f) for growth of filament %d at timestep %ld after %d trials\n", new_pos[0], new_pos[1], new_pos[2], mol_id, update->ntimestep, trials);
+  fprintf(lmp->screen, "  Sampled wrapped new position (%.3f, %.3f, %.3f) (image: %ld) for growth of filament %d at timestep %ld after %d trials\n", wrapped[0], wrapped[1], wrapped[2], image, mol_id, update->ntimestep, trials);
   
   if (!placed && comm->me == 0) {      // return early if failed placement
     error->warning(FLERR, "Fix treadmilling: failed particle placement in filament growth. ");
@@ -634,6 +677,7 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
   else {
     error->all(FLERR, "Fix treadmilling: subhead particle filpos value is not 2 or 4! Aborting! ");
   }
+  comm->forward_comm();  // propagate filpos to ghosts before proceeding
 
   // Create new particle
   //// Find new particle ID
@@ -645,8 +689,13 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
   MPI_Bcast(&new_tag, 1, MPI_LMP_TAGINT, 0, world);
   MAX_TAG = new_tag; // Global update of MAX_TAG -- executed by all processors after broadcast
   //// Locally create particle, if rank owns position of new particle
-  if (is_local(new_pos)) {
-    create_particle(new_pos, new_tag, ptype, mol_id, 1);
+  // if (is_local(new_pos)) {
+  // USE WRAPPED POSITION FOR LOCALITY CHECK AND PARTICLE CREATION
+  if (is_local(wrapped)) {
+    fprintf(lmp->screen, "    Creating new head for filament %d at timestep %ld with tag %d at position (%.3f, %.3f, %.3f) on processor %d\n", mol_id, update->ntimestep, new_tag, wrapped[0], wrapped[1], wrapped[2], comm->me);
+    create_particle(wrapped, new_tag, ptype, mol_id, 1, image);  // use wrapped position for creation, filpos = 1 for new head, pass image flags
+    // imageint image_local = ((imageint) IMGMAX << IMG2BITS) | ((imageint) IMGMAX << IMGBITS) | IMGMAX;
+    // create_particle(wrapped, new_tag, ptype, mol_id, 1, image_local);  // use wrapped position for creation, filpos = 1 for new head, pass image flags
     // Increment local count of created particles
     natomsloc++;
   }
@@ -658,11 +707,39 @@ void FixTreadmilling::grow_filament(tagint mol_id, int hidx, int shidx)
   fprintf(lmp->screen, "  Updated global atom count to %d after growth of filament %d at timestep %ld\n", atom->natoms, mol_id, update->ntimestep);
   natomsloc = 0;
 
+  fprintf(lmp->screen, "    Created new particle with tag %d at position (%.3f, %.3f, %.3f) on processor %d with filpos = %d and birth time = %f\n", atom->tag[nlocal], atom->x[nlocal][0], atom->x[nlocal][1], atom->x[nlocal][2], comm->me, atom->ivector[filpos_index][nlocal], has_creation_time ? atom->dvector[birth_time_index][nlocal] : -1.0);
+
   // Forward communicate new particle position for bond creation
   comm->forward_comm(this);
 
+  fprintf(lmp->screen, "  Comm forwarded for growth of filament %d at timestep %ld\n", mol_id, update->ntimestep);
+
+  fprintf(lmp->screen, "    Created new particle with tag %d at position (%.3f, %.3f, %.3f) on processor %d with filpos = %d and birth time = %f\n", atom->tag[nlocal], atom->x[nlocal][0], atom->x[nlocal][1], atom->x[nlocal][2], comm->me, atom->ivector[filpos_index][nlocal], has_creation_time ? atom->dvector[birth_time_index][nlocal] : -1.0);
+
   // Rebuild neighbor list for bond creation
   neighbor->build_one(list);
+
+  fprintf(lmp->screen, "  Rebuilt neighbor list for growth of filament %d at timestep %ld\n", mol_id, update->ntimestep);
+
+  fprintf(lmp->screen, "    Created new particle with tag %d at position (%.3f, %.3f, %.3f) on processor %d with filpos = %d and birth time = %f\n", atom->tag[nlocal], atom->x[nlocal][0], atom->x[nlocal][1], atom->x[nlocal][2], comm->me, atom->ivector[filpos_index][nlocal], has_creation_time ? atom->dvector[birth_time_index][nlocal] : -1.0);
+
+  // Let's look for the new particle and get its local index
+  // First reset new nlocl and tags
+  nlocal = atom->nlocal;
+  tag = atom->tag;
+  filpos = atom->ivector[filpos_index];
+  double *birth_step = atom->dvector[birth_time_index];
+  // Now scan over nlocal to find new tag and corresponding index
+  int new_idx = -1;
+  int own_proc = -1;
+  for (int i = 0; i < nlocal; i++) {
+    if (tag[i] == new_tag) {
+      new_idx = i;
+      own_proc = comm->me;
+      break;
+    }
+  }
+  fprintf(lmp->screen, "  New particle for growth of filament %d at timestep %ld has tag %d and local index %d on processor %d -- filpos = %d, birth_step = %f\n", mol_id, update->ntimestep, new_tag, new_idx, own_proc, filpos[new_idx], birth_step[new_idx]);
 
   // Create bonds (handles creation of angles too)
   create_bond(new_tag, head_tag, btype);
@@ -715,6 +792,11 @@ void FixTreadmilling::nucleate_filament()
   int nlocal = atom->nlocal;
   tagint new_mol_id = 0;
 
+  imageint image1 = ((imageint) IMGMAX << IMG2BITS) |
+                     ((imageint) IMGMAX << IMGBITS) | IMGMAX;
+  imageint image2 = ((imageint) IMGMAX << IMG2BITS) |
+                     ((imageint) IMGMAX << IMGBITS) | IMGMAX;
+
   // Attempt placement
   while (placed!=1 && trials < max_trials) {
     // First, sample new placement: only on Rank 0
@@ -734,8 +816,8 @@ void FixTreadmilling::nucleate_filament()
       pos2[2] = pos1[2] + sigma * cos(phi);
 
       // Check PBCs
-      domain->remap(pos1);
-      domain->remap(pos2);
+      domain->remap(pos1, image1);
+      domain->remap(pos2, image2);
     }
 
     // Broadcast candidate positions to all ranks
@@ -781,13 +863,13 @@ void FixTreadmilling::nucleate_filament()
   if (is_local(pos1)) {
     // If rank owns position of tail it creates tail
     int tail_fp = 4;                                                    // tail has filpos = 4 in dimer
-    create_particle(pos1, new_tag_1, ptype, new_mol_id, tail_fp);
+    create_particle(pos1, new_tag_1, ptype, new_mol_id, tail_fp, image1);
     natomsloc++;                                                        // increment local count of created particles
   }
   if (is_local(pos2)) {
     // If rank owns position of head it creates head
     int head_fp = 1;                                                    // head has filpos = 1 always, including in dimer
-    create_particle(pos2, new_tag_2, ptype, new_mol_id, head_fp);
+    create_particle(pos2, new_tag_2, ptype, new_mol_id, head_fp, image2);
     natomsloc++;                                                        // increment local count of created particles
   }
 
@@ -846,9 +928,9 @@ void FixTreadmilling::nucleate_branch(int nucleator_idx)
     int nlocal = atom->nlocal;
     tagint mol_id = ++mol_counter;  // Simple molecule ID counter
     
-    create_particle(pos1, mol_id, ptype, mol_id, 1);
-    create_particle(pos2, mol_id, ptype, mol_id, 1);
-    create_bond(nlocal, nlocal + 1, btype);
+    // create_particle(pos1, mol_id, ptype, mol_id, 1);
+    // create_particle(pos2, mol_id, ptype, mol_id, 1);
+    // create_bond(nlocal, nlocal + 1, btype);
   }
 }
 
@@ -915,7 +997,7 @@ bool FixTreadmilling::should_happen(double rate)
     updates atom map at the end so new atom is findable immediately
 ------------------------------------------------------------------------- */
 
-void FixTreadmilling::create_particle(double *pos, tagint tag, int type_id, tagint mol_id, int fp)
+void FixTreadmilling::create_particle(double *pos, tagint tag, int type_id, tagint mol_id, int fp, imageint image)
 {
   int nlocal = atom->nlocal;
   
@@ -925,6 +1007,7 @@ void FixTreadmilling::create_particle(double *pos, tagint tag, int type_id, tagi
   atom->tag[nlocal]       = tag;
   atom->molecule[nlocal]  = mol_id; // Set molecule id - same as filament
   atom->mask[nlocal]      = groupbit;
+  atom->image[nlocal]     = image;
   
   // Initialize velocity from Boltzmann distribution
   double mass = atom->mass[type_id];
@@ -941,17 +1024,21 @@ void FixTreadmilling::create_particle(double *pos, tagint tag, int type_id, tagi
   atom->f[nlocal][0] = 0.0;
   atom->f[nlocal][1] = 0.0;
   atom->f[nlocal][2] = 0.0;
-  
-  // Set the image flags to 0 for new atom
-  atom->image[nlocal] = ((imageint) IMGMAX << IMG2BITS) |
-                      ((imageint) IMGMAX << IMGBITS) | IMGMAX;
 
   // Per-atom custom properties
   if (has_creation_time) {atom->dvector[birth_time_index][nlocal] = update->ntimestep;}
   atom->ivector[filpos_index][nlocal] = fp;
 
+  fprintf(lmp->screen, "    Created new particle with tag %d at position (%.3f, %.3f, %.3f) on processor %d with filpos = %d and birth time = %f\n", tag, pos[0], pos[1], pos[2], comm->me, atom->ivector[filpos_index][nlocal], has_creation_time ? atom->dvector[birth_time_index][nlocal] : -1.0);
+
   // Update atom map so new tag is findable immediately
   if (atom->map_style != Atom::MAP_NONE) {atom->map_one(tag, nlocal);}
+
+  fprintf(lmp->screen, "    Created new particle with tag %d at position (%.3f, %.3f, %.3f) on processor %d with filpos = %d and birth time = %f\n", tag, pos[0], pos[1], pos[2], comm->me, atom->ivector[filpos_index][nlocal], has_creation_time ? atom->dvector[birth_time_index][nlocal] : -1.0);
+
+  // // Set neighbour list flag to indicate new atom added (forces rebuild of neighbor list before next force calculation)
+  // neighbor->set_dirty(ACTION_NEIGH);
+  // neighbor->set_dirty(ACTION_SPECIAL);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1467,6 +1554,8 @@ int FixTreadmilling::pack_forward_comm(int n, int *list, double *buf,
 
   int **nspecial = atom->nspecial;
   tagint **special = atom->special;
+  int *filpos      = atom->ivector[filpos_index];
+  double *birth    = has_creation_time ? atom->dvector[birth_time_index] : nullptr;
 
   m = 0;
   for (i = 0; i < n; i++) {
@@ -1475,6 +1564,8 @@ int FixTreadmilling::pack_forward_comm(int n, int *list, double *buf,
     buf[m++] = ubuf(ns).d;
     for (k = 0; k < ns; k++)
       buf[m++] = ubuf(special[j][k]).d;
+    // buf[m++] = ubuf(filpos[j]).d;
+    // if (has_creation_time) buf[m++] = ubuf(birth[j]).d;
   }
   return m;
 }
@@ -1488,6 +1579,8 @@ void FixTreadmilling::unpack_forward_comm(int n, int first, double *buf)
 
   int **nspecial = atom->nspecial;
   tagint **special = atom->special;
+  int *filpos      = atom->ivector[filpos_index];
+  double *birth    = has_creation_time ? atom->dvector[birth_time_index] : nullptr;
 
   m = 0;
   last = first + n;
@@ -1496,6 +1589,8 @@ void FixTreadmilling::unpack_forward_comm(int n, int first, double *buf)
     nspecial[i][0] = ns;
     for (j = 0; j < ns; j++)
       special[i][j] = (tagint) ubuf(buf[m++]).i;
+    // filpos[i] = (int) ubuf(buf[m++]).i;
+    // if (has_creation_time) birth[i] = ubuf(buf[m++]).d;
   }
 }
 

@@ -94,25 +94,25 @@ class FixTreadmilling : public Fix {
   tagint MAX_MOL;
 
   // Temperature
-  double temp;                                                    // system temperature, for velocity initialization during creation - assumed constant and uniform for now, but could be made more complex in the future by accessing compute_temp or similar
+  double temp;                                                             // system temperature, for velocity initialization during creation - assumed constant and uniform for now, but could be made more complex in the future by accessing compute_temp or similar
 
   // Helper methods
-  void grow_filament(tagint, int, int);                           // add particle at head of filament i
-  void shrink_filament(int);                                      // remove particle from tail of filament i
-  void nucleate_filament();                                       // nucleate new free filament
-  void nucleate_branch(int);                                      // nucleate branch from atom i
+  void grow_filament(tagint, int, int);                                    // add particle at head of filament i
+  void shrink_filament(int);                                               // remove particle from tail of filament i
+  void nucleate_filament();                                                // nucleate new free filament
+  void nucleate_branch(int);                                               // nucleate branch from atom i
   
-  bool check_overlap(double *);                                   // check if position overlaps with others (globally)
-  bool should_happen(double);                                     // check if a rate-controlled event occurs based on the rate and timestep
+  bool check_overlap(double *);                                            // check if position overlaps with others (globally)
+  bool should_happen(double);                                              // check if a rate-controlled event occurs based on the rate and timestep
   
-  void create_particle(double *, tagint, int, tagint, int);       // create particle locally and update atom map
-  void delete_particle(int);                                      // delete particle and update filament
-  void create_bond(tagint, tagint, int);                          // create bond of given type (int) between given atoms (tags)
-  int delete_bonds(int);                                          // delete bonds involving particle i, return index for bound particle (index for subtail which become new tail)
+  void create_particle(double *, tagint, int, tagint, int, imageint);      // create particle locally and update atom map
+  void delete_particle(int);                                               // delete particle and update filament
+  void create_bond(tagint, tagint, int);                                   // create bond of given type (int) between given atoms (tags)
+  int delete_bonds(int);                                                   // delete bonds involving particle i, return index for bound particle (index for subtail which become new tail)
   
-  double compute_shrinkage_rate(double);                          // compute r_off(lifetime) = r_0(1-exp(-r_hyd*lifetime))
+  double compute_shrinkage_rate(double);                                   // compute r_off(lifetime) = r_0(1-exp(-r_hyd*lifetime))
 
-  bool is_local(double *);                                        // check if position is local to this processor
+  bool is_local(double *);                                                 // check if position is local to this processor
 };
 
 }  // namespace LAMMPS_NS

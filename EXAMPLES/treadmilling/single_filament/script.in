@@ -23,7 +23,7 @@ variable            Kbond equal 1000.0                            # bond constan
 variable            Kbend equal 800.0                             # bend constant [kT/sigma2]
 variable            tstep equal 0.001000                          # simulation timestep size [seconds]
 variable            run_time equal 600.0                          # simulation run time [seconds] 45.0 #
-variable            frame_rate equal 1.0                          # dumping interval [seconds]
+variable            frame_rate equal 0.01 #0.5 #1.0                          # dumping interval [seconds]
 variable            seed equal 1234                               # random number generator seed
 
 variable            rstep equal 1.0/${tstep}                      # reaction interval [simulation steps]
@@ -36,15 +36,17 @@ variable r_off   equal 0.00
 variable r_hyd   equal 0.1
 variable r_nuc   equal 0.0
 variable sigma_tm equal 1.0
-variable noise_tm equal 0.1
+variable noise_tm equal 0.00
 variable maxtrials equal 100
-variable overlap_tm equal 1.2
+variable overlap_tm equal 0.9
 variable ptype_tm equal 1
 variable btype_tm equal 1
 variable atype_tm equal 1
 variable seed_tm equal 12345
 
-special_bonds       lj 1.0 1.0 1.0
+#special_bonds       lj 1.0 1.0 1.0
+special_bonds       lj 0.0 0.0 1.0
+
 bond_style          harmonic
 bond_coeff          1 ${Kbond} 1.0
 
@@ -59,6 +61,8 @@ fix                 fTread all treadmilling ${rstep} r_on ${r_on} r_off ${r_off}
 fix                 fLang all langevin 1.0 1.0 1.0 ${seed}
 fix                 fNVE all nve
 
+#communicate single cutoff 3.0   # must exceed bond_length + skin
+#neighbor 2.0 bin
 
 variable            realtime equal step*${tstep}
 
